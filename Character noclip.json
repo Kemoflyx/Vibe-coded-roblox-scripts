@@ -1,107 +1,105 @@
 -- Humanoid Ghosting (Universal: R6 + R15)
 -- Client-side, persistent, players + NPCs
 -- Fully self-reapplying (respawn / join / NPC spawn safe)
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-
 local LocalPlayer = Players.LocalPlayer
 local tracked = {}
 
 -- ===== Utilities =====
-
 local function isLocalCharacter(model)
-	return LocalPlayer.Character and model == LocalPlayer.Character
+    return LocalPlayer.Character and model == LocalPlayer.Character
 end
 
 local function isValidHumanoidModel(model)
-	if not model:IsA("Model") then return false end
-	if isLocalCharacter(model) then return false end
-
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-	local hrp = model:FindFirstChild("HumanoidRootPart")
-
-	return humanoid ~= nil and hrp ~= nil
+    if not model:IsA("Model") then return false end
+    if isLocalCharacter(model) then return false end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+    return humanoid ~= nil and hrp ~= nil
 end
 
 local function collectParts(model)
-	local parts = {}
-
-	for _, d in ipairs(model:GetDescendants()) do
-		if d:IsA("BasePart") then
-			parts[#parts + 1] = d
-		end
-	end
-
-	return parts
+    local parts = {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then
+            parts[#parts + 1] = d
+        end
+    end
+    return parts
 end
 
 -- ===== Tracking =====
-
 local function trackModel(model)
-	if tracked[model] then return end
-	if not isValidHumanoidModel(model) then return end
-
-	tracked[model] = collectParts(model)
+    if tracked[model] then return end
+    if not isValidHumanoidModel(model) then return end
+    tracked[model] = collectParts(model)
 end
 
 -- ===== Continuous World Scan (CRITICAL) =====
-
 local function rescanWorld()
-	for _, inst in ipairs(Workspace:GetDescendants()) do
-		if inst:IsA("Model") then
-			trackModel(inst)
-		end
-	end
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            trackModel(inst)
+        end
+    end
 end
 
 -- Initial scan
 rescanWorld()
 
--- Periodic rescan to catch EVERYTHING (respawns, rebuilds, late joins)
+-- FIXED: More aggressive rescan to catch new players
 task.spawn(function()
-	while true do
-		rescanWorld()
-		task.wait(1) -- low cost, very reliable
-	end
+    while true do
+        rescanWorld()
+        task.wait(0.5) -- Reduced from 1 second for faster detection
+    end
 end)
 
 -- ===== Player Handling =====
-
 local function onCharacterAdded(char)
-	task.wait(0.1)
-	trackModel(char)
+    task.wait(0.1)
+    trackModel(char)
 end
 
 local function onPlayerAdded(plr)
-	plr.CharacterAdded:Connect(onCharacterAdded)
-	if plr.Character then
-		onCharacterAdded(plr.Character)
-	end
+    plr.CharacterAdded:Connect(onCharacterAdded)
+    if plr.Character then
+        onCharacterAdded(plr.Character)
+    end
 end
 
+-- Connect PlayerAdded
 Players.PlayerAdded:Connect(onPlayerAdded)
 
+-- Handle existing players
 for _, plr in ipairs(Players:GetPlayers()) do
-	onPlayerAdded(plr)
+    onPlayerAdded(plr)
 end
 
--- ===== Enforcement Loop (Infinite Yield style) =====
+-- ADDED: Workspace.ChildAdded as backup for new player characters
+Workspace.ChildAdded:Connect(function(child)
+    if child:IsA("Model") then
+        task.wait(0.2) -- Wait for character to fully load
+        trackModel(child)
+    end
+end)
 
+-- ===== Enforcement Loop (Infinite Yield style) =====
 RunService.Stepped:Connect(function()
-	for model, parts in pairs(tracked) do
-		if not model.Parent then
-			tracked[model] = nil
-		else
-			for i = #parts, 1, -1 do
-				local p = parts[i]
-				if not p or not p.Parent then
-					table.remove(parts, i)
-				else
-					p.CanCollide = false
-				end
-			end
-		end
-	end
+    for model, parts in pairs(tracked) do
+        if not model.Parent then
+            tracked[model] = nil
+        else
+            for i = #parts, 1, -1 do
+                local p = parts[i]
+                if not p or not p.Parent then
+                    table.remove(parts, i)
+                else
+                    p.CanCollide = false
+                end
+            end
+        end
+    end
 end)
