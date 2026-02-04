@@ -1,0 +1,179 @@
+--// Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Camera = workspace.CurrentCamera
+
+local LocalPlayer = Players.LocalPlayer
+
+--// ===== SETTINGS =====
+local MAX_LENGTH = 105
+local SPEED_SCALE = 0.11
+local MIN_LENGTH = 4
+
+local LINE_THICKNESS = 4
+local ARROW_THICKNESS = 3
+
+local LINE_COLOR = Color3.fromRGB(180, 0, 255)   -- purple shaft
+local ARROW_COLOR = Color3.fromRGB(0, 255, 255)  -- neon cyan arrow
+local TEXT_COLOR = Color3.fromRGB(200, 200, 255)
+
+local SMOOTHING = 0.75
+local ARROW_SIZE = 10
+local VELOCITY_EPSILON = 0.001
+
+--// Storage
+local Objects = {}
+
+--// Drawing helpers
+local function newLine(thickness, color)
+    local l = Drawing.new("Line")
+    l.Visible = false
+    l.Thickness = thickness
+    l.Color = color
+    l.Transparency = 1
+    l.ZIndex = 1
+    return l
+end
+
+local function newText()
+    local t = Drawing.new("Text")
+    t.Visible = false
+    t.Size = 13
+    t.Center = true
+    t.Outline = true
+    t.Color = TEXT_COLOR
+    t.Transparency = 1
+    t.ZIndex = 10        -- force on top of everything
+    return t
+end
+
+--// Create visuals
+local function create(player)
+    Objects[player] = {
+        main = newLine(LINE_THICKNESS, LINE_COLOR),
+        arrowL = newLine(ARROW_THICKNESS, ARROW_COLOR),
+        arrowR = newLine(ARROW_THICKNESS, ARROW_COLOR),
+        dist = newText(),
+        lastTo = nil
+    }
+end
+
+--// Cleanup
+local function remove(player)
+    local obj = Objects[player]
+    if not obj then return end
+    for _, d in pairs(obj) do
+        if typeof(d) == "userdata" then
+            d:Remove()
+        end
+    end
+    Objects[player] = nil
+end
+
+--// Init
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then
+        create(p)
+    end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    if p ~= LocalPlayer then
+        create(p)
+    end
+end)
+
+Players.PlayerRemoving:Connect(remove)
+
+--// ===== UPDATE LOOP =====
+RunService.RenderStepped:Connect(function()
+    local myChar = LocalPlayer.Character
+    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+
+    for player, obj in pairs(Objects) do
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+        if not hrp then
+            obj.main.Visible = false
+            obj.arrowL.Visible = false
+            obj.arrowR.Visible = false
+            obj.dist.Visible = false
+            continue
+        end
+
+        local worldPos = hrp.Position
+        local screenPos, onScreen = Camera:WorldToViewportPoint(worldPos)
+
+        if not onScreen then
+            obj.main.Visible = false
+            obj.arrowL.Visible = false
+            obj.arrowR.Visible = false
+            obj.dist.Visible = false
+            continue
+        end
+
+        -- ===== Distance (ALWAYS VISIBLE, THROUGH EVERYTHING) =====
+        local distStuds = (myHRP.Position - worldPos).Magnitude
+        obj.dist.Text = string.format("%.1f studs", distStuds)
+        obj.dist.Position = Vector2.new(screenPos.X, screenPos.Y + 18)
+        obj.dist.Visible = true
+
+        -- ===== Velocity Detection =====
+        local vel = hrp.AssemblyLinearVelocity
+        local speed = vel.Magnitude
+
+        if speed > VELOCITY_EPSILON then
+            local dir = vel.Unit
+            local length = math.clamp(speed * SPEED_SCALE, MIN_LENGTH, MAX_LENGTH)
+
+            local endWorld = worldPos + dir * length
+            local endScreen = Camera:WorldToViewportPoint(endWorld)
+
+            local from2D = Vector2.new(screenPos.X, screenPos.Y)
+            local to2D = Vector2.new(endScreen.X, endScreen.Y)
+
+            -- Snappy smoothing
+            if obj.lastTo then
+                to2D = obj.lastTo:Lerp(to2D, SMOOTHING)
+            end
+            obj.lastTo = to2D
+
+            -- Main line
+            obj.main.From = from2D
+            obj.main.To = to2D
+            obj.main.Visible = true
+
+            -- Arrowhead
+            local angle = math.atan2(
+                to2D.Y - from2D.Y,
+                to2D.X - from2D.X
+            )
+
+            local leftAngle = angle + math.rad(150)
+            local rightAngle = angle - math.rad(150)
+
+            obj.arrowL.From = to2D
+            obj.arrowL.To = to2D + Vector2.new(
+                math.cos(leftAngle) * ARROW_SIZE,
+                math.sin(leftAngle) * ARROW_SIZE
+            )
+
+            obj.arrowR.From = to2D
+            obj.arrowR.To = to2D + Vector2.new(
+                math.cos(rightAngle) * ARROW_SIZE,
+                math.sin(rightAngle) * ARROW_SIZE
+            )
+
+            obj.arrowL.Visible = true
+            obj.arrowR.Visible = true
+        else
+            -- Stationary: no direction, distance still shown
+            obj.main.Visible = false
+            obj.arrowL.Visible = false
+            obj.arrowR.Visible = false
+            obj.lastTo = nil
+        end
+    end
+end)
