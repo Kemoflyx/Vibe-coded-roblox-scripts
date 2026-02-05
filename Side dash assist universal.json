@@ -1,0 +1,326 @@
+-- Side Dash Assist Script (EVENT-DRIVEN OPTIMIZED - NPC FIX)
+-- Press E to activate side dash with lock-on and movement
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid = character:WaitForChild("Humanoid")
+
+local isActive = false
+local currentTarget = nil
+
+-- Configuration
+local DASH_DURATION = 0.3
+local DASH_DURATION_CLOSE = 0.2
+local CLOSE_RANGE_THRESHOLD = 25
+local CIRCLE_RADIUS = 5
+local MAX_LOCK_DISTANCE = 75
+
+-- OPTIMIZATION: Event-driven cache - only updates when something joins/respawns
+local targetCache = {} -- Stores {Root = part, Humanoid = humanoid}
+
+-- Add a target to cache
+local function addToCache(targetCharacter)
+    if targetCharacter == character then return end -- Don't cache yourself
+    
+    local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart") or targetCharacter:FindFirstChild("Torso") or targetCharacter:FindFirstChild("Head")
+    local targetHumanoid = targetCharacter:FindFirstChildOfClass("Humanoid")
+    
+    if targetRoot and targetRoot:IsA("BasePart") and targetHumanoid then
+        local cacheEntry = {
+            Root = targetRoot,
+            Humanoid = targetHumanoid,
+            Character = targetCharacter
+        }
+        
+        targetCache[targetCharacter] = cacheEntry
+        
+        -- Clean up when character is removed (death/leaving)
+        targetCharacter.AncestryChanged:Connect(function(_, parent)
+            if not parent then
+                targetCache[targetCharacter] = nil
+            end
+        end)
+        
+        -- Update cache entry when they respawn (for players)
+        targetHumanoid.Died:Connect(function()
+            -- Keep the entry but mark as dead, will update on respawn
+            if targetCache[targetCharacter] then
+                targetCache[targetCharacter].Dead = true
+            end
+        end)
+        
+        return true
+    end
+    return false
+end
+
+-- Remove a target from cache
+local function removeFromCache(targetCharacter)
+    targetCache[targetCharacter] = nil
+end
+
+-- Setup tracking for a player (handles respawns automatically)
+local function setupPlayerTracking(targetPlayer)
+    if targetPlayer == player then return end -- Don't track yourself
+    
+    -- Add their current character if it exists
+    if targetPlayer.Character then
+        addToCache(targetPlayer.Character)
+    end
+    
+    -- Track future respawns
+    targetPlayer.CharacterAdded:Connect(function(newCharacter)
+        -- Remove old character reference
+        for cachedChar, _ in pairs(targetCache) do
+            if cachedChar.Parent == targetPlayer then
+                targetCache[cachedChar] = nil
+            end
+        end
+        
+        -- Add new character
+        addToCache(newCharacter)
+    end)
+    
+    -- Clean up when player leaves
+    targetPlayer.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            for cachedChar, _ in pairs(targetCache) do
+                if cachedChar.Parent == targetPlayer then
+                    targetCache[cachedChar] = nil
+                end
+            end
+        end
+    end)
+end
+
+-- Recursively search for NPC models (handles nested folders)
+local function searchForNPCsRecursive(parent, depth)
+    depth = depth or 0
+    if depth > 5 then return 0 end -- Prevent infinite recursion
+    
+    local npcCount = 0
+    
+    for _, child in ipairs(parent:GetChildren()) do
+        -- If it's a model with a humanoid, try to cache it
+        if child:IsA("Model") then
+            if addToCache(child) then
+                npcCount = npcCount + 1
+            end
+        end
+        
+        -- If it's a folder, search inside it
+        if child:IsA("Folder") or child:IsA("Model") then
+            npcCount = npcCount + searchForNPCsRecursive(child, depth + 1)
+        end
+    end
+    
+    return npcCount
+end
+
+-- Initial scan for NPCs/Dummies in workspace (one-time on script load)
+local function scanForNPCs()
+    local npcCount = 0
+    
+    -- First, try common NPC folder names
+    local commonFolderNames = {
+        "NPCs", "Enemies", "Mobs", "Dummies", "Characters", 
+        "Monsters", "Bosses", "Entities", "AI", "Units"
+    }
+    
+    for _, folderName in ipairs(commonFolderNames) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder then
+            print("[Side Dash] Found folder:", folderName)
+            local count = searchForNPCsRecursive(folder)
+            npcCount = npcCount + count
+            
+            -- Track NEW NPCs added to this folder
+            folder.ChildAdded:Connect(function(child)
+                if child:IsA("Model") then
+                    task.wait(0.1) -- Wait for parts to load
+                    if addToCache(child) then
+                        print("[Side Dash] New NPC added:", child.Name)
+                    end
+                end
+            end)
+        end
+    end
+    
+    -- If no NPCs found in folders, search directly in workspace
+    if npcCount == 0 then
+        print("[Side Dash] No common folders found, searching workspace directly...")
+        
+        for _, child in ipairs(workspace:GetChildren()) do
+            if child:IsA("Model") and child ~= character then
+                local hasHumanoid = child:FindFirstChildOfClass("Humanoid")
+                if hasHumanoid then
+                    if addToCache(child) then
+                        npcCount = npcCount + 1
+                        print("[Side Dash] Found NPC in workspace:", child.Name)
+                    end
+                end
+            end
+        end
+        
+        -- Also track new NPCs spawned directly in workspace
+        workspace.ChildAdded:Connect(function(child)
+            if child:IsA("Model") then
+                task.wait(0.1)
+                local hasHumanoid = child:FindFirstChildOfClass("Humanoid")
+                if hasHumanoid and addToCache(child) then
+                    print("[Side Dash] New NPC spawned in workspace:", child.Name)
+                end
+            end
+        end)
+    end
+    
+    return npcCount
+end
+
+-- Function to simulate D + Q key press
+local function simulateDashInput()
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.D, false, game)
+    task.wait(0.01)
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.D, false, game)
+end
+
+-- OPTIMIZED: Find nearest target from cache (instant lookup)
+local function findNearestTarget()
+    local nearestTarget = nil
+    local shortestDistanceSquared = MAX_LOCK_DISTANCE * MAX_LOCK_DISTANCE
+    local myPosition = humanoidRootPart.Position
+    
+    -- Iterate through cached targets only
+    for _, targetData in pairs(targetCache) do
+        -- Check if still valid and alive
+        if targetData.Root and targetData.Root.Parent and targetData.Humanoid and targetData.Humanoid.Health > 0 then
+            -- Use squared distance (no sqrt needed for comparison)
+            local offset = targetData.Root.Position - myPosition
+            local distanceSquared = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
+            
+            if distanceSquared < shortestDistanceSquared then
+                shortestDistanceSquared = distanceSquared
+                nearestTarget = targetData.Root
+            end
+        end
+    end
+    
+    return nearestTarget
+end
+
+-- OPTIMIZED: Perform the side dash
+local function performSideDash()
+    if isActive then return end
+    
+    currentTarget = findNearestTarget()
+    if not currentTarget then
+        print("[Side Dash] No valid targets found in range")
+        return
+    end
+    
+    isActive = true
+    
+    -- Trigger the game's native side dash (D + Q)
+    simulateDashInput()
+    
+    -- Pre-calculate vectors
+    local startPos = humanoidRootPart.Position
+    local targetPos = currentTarget.Position
+    
+    -- Calculate YOUR right side
+    local myLookVector = humanoidRootPart.CFrame.LookVector
+    local myRightVector = Vector3.new(-myLookVector.Z, 0, myLookVector.X).Unit
+    
+    -- Position to YOUR right, near the target
+    local targetSidePosition = targetPos + myRightVector * CIRCLE_RADIUS
+    
+    -- Calculate distance
+    local offset = targetSidePosition - startPos
+    local distance = math.sqrt(offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z)
+    local adjustedDuration = distance < CLOSE_RANGE_THRESHOLD and DASH_DURATION_CLOSE or DASH_DURATION
+    
+    -- Create CFrames
+    local startCFrame = humanoidRootPart.CFrame
+    local goalCFrame = CFrame.new(targetSidePosition) * (startCFrame - startCFrame.Position)
+    
+    -- Store original states
+    local originalWalkSpeed = humanoid.WalkSpeed
+    humanoid.WalkSpeed = 0
+    
+    -- Manual interpolation
+    local startTime = tick()
+    local connection
+    
+    connection = RunService.Heartbeat:Connect(function()
+        local elapsed = tick() - startTime
+        local progress = math.min(elapsed / adjustedDuration, 1)
+        
+        -- Quad Out easing
+        local alpha = 1 - (1 - progress) * (1 - progress)
+        
+        -- Interpolate CFrame smoothly
+        humanoidRootPart.CFrame = startCFrame:Lerp(goalCFrame, alpha)
+        
+        if progress >= 1 then
+            connection:Disconnect()
+            humanoid.WalkSpeed = originalWalkSpeed
+            isActive = false
+        end
+    end)
+end
+
+-- Input handling
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    if input.KeyCode == Enum.KeyCode.E then
+        performSideDash()
+    end
+end)
+
+-- Handle YOUR character respawn
+player.CharacterAdded:Connect(function(newCharacter)
+    character = newCharacter
+    humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+    humanoid = character:WaitForChild("Humanoid")
+    isActive = false
+end)
+
+-- INITIALIZATION: Set up event-driven tracking
+
+-- Track all existing players
+for _, otherPlayer in ipairs(Players:GetPlayers()) do
+    setupPlayerTracking(otherPlayer)
+end
+
+-- Track NEW players that join
+Players.PlayerAdded:Connect(function(newPlayer)
+    setupPlayerTracking(newPlayer)
+end)
+
+-- One-time scan for NPCs/Dummies
+local playerCount = #Players:GetPlayers() - 1
+local npcCount = scanForNPCs()
+
+print("[Side Dash] Initialized")
+print("[Side Dash] Tracking", playerCount, "players and", npcCount, "NPCs/Dummies")
+print("[Side Dash] Total targets cached:", #targetCache)
+
+-- Debug: List first few cached targets
+local debugCount = 0
+for char, data in pairs(targetCache) do
+    if debugCount < 5 then
+        print("[Side Dash] Cached:", char.Name, "| Health:", data.Humanoid.Health)
+        debugCount = debugCount + 1
+    end
+end
