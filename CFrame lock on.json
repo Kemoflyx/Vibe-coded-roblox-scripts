@@ -1,5 +1,3 @@
--- MAXIMUM STICKINESS - RAW OVERRIDE MODE
--- No timing, no fancy shit, just LOCK and DOMINATE
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -133,3 +131,4 @@ player.CharacterAdded:Connect(function(char)
     lockedTarget = nil
     removeHighlight()
 end)
+
