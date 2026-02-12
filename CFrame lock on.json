@@ -1,4 +1,4 @@
--- Minimal Character-Only Lock-On (Optimized + Subtle Highlight)
+-- ULTRA-OPTIMIZED Character Lock-On (ZERO LAG + SERVER POSITION)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -11,63 +11,32 @@ local hrp = character:WaitForChild("HumanoidRootPart")
 
 -- ===== CONFIG =====
 local LOCK_KEY = Enum.KeyCode.E
-local PREDICTION = 0.1
-
-local PITCH_SPEED = 0.35
-local MAX_PITCH = math.rad(45)
-
-local GROUND_PITCH_MULT = 0.25
-local AIR_PITCH_MULT = 1
-local AIR_Y_THRESHOLD = 3
-
-local RELOCK_INTERVAL = 0.5
+local RELOCK_INTERVAL = 0.2
+local MAX_TARGET_DISTANCE = 500 -- Don't check targets further than this (performance)
 -- ==================
 
 -- ===== STATE =====
 local lockedTarget
-local targetVelocity = Vector3.zero
 local isLocked = false
 local originalAutoRotate = humanoid.AutoRotate
 local lastRelock = 0
 
-local rootJoint
-local originalC0
-local currentPitch = 0
-
 local targetHighlight
+
+-- OPTIMIZED: Use dictionary for O(1) lookups instead of array
+local targetCache = {} -- [HumanoidRootPart] = {humanoid, character}
+local cacheInitialized = false
 -- =================
 
--- ===== JOINT SETUP =====
-local function setupJoint()
-    if character:FindFirstChild("LowerTorso") then
-        rootJoint = character.LowerTorso:FindFirstChild("Root")
-    else
-        rootJoint = hrp:FindFirstChild("RootJoint")
-    end
-    if rootJoint then
-        originalC0 = rootJoint.C0
-    end
-end
-
-setupJoint()
-
-local function resetPitch()
-    if rootJoint and originalC0 then
-        rootJoint.C0 = originalC0
-    end
-    currentPitch = 0
-end
--- ======================
-
--- ===== HIGHLIGHT =====
+-- ===== BRIGHT WHITE HIGHLIGHT =====
 local function applyHighlight(target)
     if targetHighlight then targetHighlight:Destroy() end
 
     local h = Instance.new("Highlight")
     h.Adornee = target.Parent
-    h.FillTransparency = 1 -- no fill
-    h.OutlineTransparency = 0.35
-    h.OutlineColor = Color3.fromRGB(80, 200, 190) -- soft cyan/teal
+    h.FillTransparency = 1
+    h.OutlineTransparency = 0
+    h.OutlineColor = Color3.fromRGB(255, 255, 255)
     h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     h.Parent = target.Parent
 
@@ -80,36 +49,122 @@ local function removeHighlight()
         targetHighlight = nil
     end
 end
--- =====================
+-- ==================================
 
--- ===== TARGET FIND =====
+-- ===== EFFICIENT TARGET CACHING =====
+local function addToCache(root, hum, char)
+    if hum.Health > 0 and root and char then
+        targetCache[root] = {
+            humanoid = hum,
+            character = char
+        }
+    end
+end
+
+local function removeFromCache(root)
+    if targetCache[root] then
+        targetCache[root] = nil
+    end
+end
+
+-- OPTIMIZED: Only search for PLAYERS, not every random NPC
+local function initializeCache()
+    if cacheInitialized then return end
+    
+    print("[Lock-On] Building player cache... (fast)")
+    targetCache = {}
+    
+    -- Only cache PLAYERS (super fast, no lag)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local char = plr.Character
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if hum and root then
+                addToCache(root, hum, char)
+            end
+        end
+    end
+    
+    cacheInitialized = true
+    print("[Lock-On] Cache ready! (" .. #Players:GetPlayers()-1 .. " players cached)")
+end
+
+-- Auto-add new players instantly (no lag)
+Players.PlayerAdded:Connect(function(newPlayer)
+    newPlayer.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum and root then
+            addToCache(root, hum, char)
+        end
+    end)
+end)
+
+-- Monitor existing players for respawns
+for _, existingPlayer in ipairs(Players:GetPlayers()) do
+    if existingPlayer ~= player then
+        existingPlayer.CharacterAdded:Connect(function(char)
+            task.wait(0.5)
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if hum and root then
+                addToCache(root, hum, char)
+            end
+        end)
+    end
+end
+
+-- Clean up when player leaves (no lag)
+Players.PlayerRemoving:Connect(function(leavingPlayer)
+    if leavingPlayer.Character then
+        local root = leavingPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root then
+            removeFromCache(root)
+        end
+    end
+end)
+-- ====================================
+
+-- ===== OPTIMIZED TARGET FIND (WITH DISTANCE CULLING) =====
 local function findClosestTarget()
+    if not cacheInitialized then
+        initializeCache()
+    end
+    
     local cam = workspace.CurrentCamera
     local mouse = UserInputService:GetMouseLocation()
     local best, bestDist = nil, math.huge
+    local myPos = hrp.Position
 
-    for _, hum in ipairs(workspace:GetDescendants()) do
-        if hum:IsA("Humanoid") and hum.Health > 0 then
-            local char = hum.Parent
-            if char ~= character then
-                local root = char:FindFirstChild("HumanoidRootPart")
-                if root then
-                    local pos, onScreen = cam:WorldToViewportPoint(root.Position)
-                    if onScreen then
-                        local d = (Vector2.new(pos.X, pos.Y) - mouse).Magnitude
-                        if d < bestDist then
-                            bestDist = d
-                            best = root
-                        end
+    -- Iterate through dictionary (very fast)
+    for root, data in pairs(targetCache) do
+        -- Quick validity check
+        if root.Parent and data.humanoid.Health > 0 then
+            
+            -- DISTANCE CULLING: Skip if too far (massive performance boost)
+            local distance = (root.Position - myPos).Magnitude
+            if distance <= MAX_TARGET_DISTANCE then
+                
+                local pos, onScreen = cam:WorldToViewportPoint(root.Position)
+                if onScreen then
+                    local d = (Vector2.new(pos.X, pos.Y) - mouse).Magnitude
+                    if d < bestDist then
+                        bestDist = d
+                        best = root
                     end
                 end
             end
+        else
+            -- Dead/invalid target - remove from cache immediately
+            removeFromCache(root)
         end
     end
 
     return best
 end
--- =======================
+-- =========================================================
 
 local function isRagdolled()
     local s = humanoid:GetState()
@@ -119,39 +174,29 @@ local function isRagdolled()
 end
 
 local function validTarget(t)
-    local h = t and t.Parent and t.Parent:FindFirstChildOfClass("Humanoid")
-    return h and h.Health > 0
+    if not t or not t.Parent then return false end
+    local data = targetCache[t]
+    if not data then return false end
+    return data.humanoid.Health > 0
 end
 
--- ===== ROTATION =====
+-- ===== SERVER POSITION TRACKING =====
 local function updateRotation()
-    local vel = lockedTarget.AssemblyLinearVelocity or Vector3.zero
-    targetVelocity = targetVelocity:Lerp(vel, 0.4)
-
-    local predicted = lockedTarget.Position + targetVelocity * PREDICTION
-    local dir = predicted - hrp.Position
+    if not lockedTarget or not lockedTarget.Parent then return end
+    
+    -- SERVER POSITION ONLY
+    local targetPos = lockedTarget.CFrame.Position
+    local dir = targetPos - hrp.Position
     if dir.Magnitude < 0.01 then return end
 
-    -- YAW
+    -- INSTANT SNAP - HORIZONTAL ONLY
     local flat = Vector3.new(dir.X, 0, dir.Z)
     if flat.Magnitude > 0.01 then
         local _, y, _ = CFrame.lookAt(hrp.Position, hrp.Position + flat):ToOrientation()
         hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, y, 0)
     end
-
-    -- PITCH
-    if rootJoint and originalC0 then
-        local rawPitch = math.atan2(dir.Y, flat.Magnitude)
-        local air = math.abs(dir.Y) > AIR_Y_THRESHOLD
-        local mult = air and AIR_PITCH_MULT or GROUND_PITCH_MULT
-
-        local desired = math.clamp(rawPitch * mult, -MAX_PITCH, MAX_PITCH)
-        currentPitch += (desired - currentPitch) * PITCH_SPEED
-
-        rootJoint.C0 = originalC0 * CFrame.Angles(-currentPitch, 0, 0)
-    end
 end
--- ====================
+-- ====================================
 
 -- ===== TOGGLE =====
 local function toggleLock()
@@ -159,14 +204,12 @@ local function toggleLock()
         isLocked = false
         lockedTarget = nil
         humanoid.AutoRotate = originalAutoRotate
-        resetPitch()
         removeHighlight()
     else
         local t = findClosestTarget()
         if t then
             isLocked = true
             lockedTarget = t
-            targetVelocity = t.AssemblyLinearVelocity or Vector3.zero
             humanoid.AutoRotate = false
             lastRelock = tick()
             applyHighlight(t)
@@ -181,13 +224,12 @@ UserInputService.InputBegan:Connect(function(i, gp)
     end
 end)
 
--- ===== MAIN LOOP =====
-RunService.RenderStepped:Connect(function()
+-- ===== OPTIMIZED MAIN LOOP (Heartbeat instead of RenderStepped) =====
+RunService.Heartbeat:Connect(function()
     if not isLocked then return end
 
     if isRagdolled() then
         humanoid.AutoRotate = originalAutoRotate
-        resetPitch()
         removeHighlight()
         return
     end
@@ -205,7 +247,7 @@ RunService.RenderStepped:Connect(function()
 
     updateRotation()
 end)
--- ====================
+-- =====================================================================
 
 -- ===== RESPAWN =====
 player.CharacterAdded:Connect(function(c)
@@ -213,8 +255,6 @@ player.CharacterAdded:Connect(function(c)
     humanoid = c:WaitForChild("Humanoid")
     hrp = c:WaitForChild("HumanoidRootPart")
     originalAutoRotate = humanoid.AutoRotate
-    setupJoint()
-    resetPitch()
     removeHighlight()
     isLocked = false
 end)
