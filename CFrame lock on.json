@@ -1,4 +1,5 @@
--- ULTRA-OPTIMIZED Character Lock-On (ZERO LAG + 0.13 PREDICTION)
+-- MAXIMUM STICKINESS - RAW OVERRIDE MODE
+-- No timing, no fancy shit, just LOCK and DOMINATE
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,31 +10,14 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local hrp = character:WaitForChild("HumanoidRootPart")
 
--- ===== CONFIG =====
 local LOCK_KEY = Enum.KeyCode.E
-local PREDICTION = 0.13
-local RELOCK_INTERVAL = 0.2
-local MAX_TARGET_DISTANCE = 500 -- Don't check targets further than this (performance)
--- ==================
-
--- ===== STATE =====
-local lockedTarget
-local targetVelocity = Vector3.zero
+local lockedTarget = nil
 local isLocked = false
-local originalAutoRotate = humanoid.AutoRotate
-local lastRelock = 0
+local targetHighlight = nil
 
-local targetHighlight
-
--- OPTIMIZED: Use dictionary for O(1) lookups instead of array
-local targetCache = {} -- [HumanoidRootPart] = {humanoid, character}
-local cacheInitialized = false
--- =================
-
--- ===== BRIGHT WHITE HIGHLIGHT =====
+-- ===== HIGHLIGHT =====
 local function applyHighlight(target)
     if targetHighlight then targetHighlight:Destroy() end
-
     local h = Instance.new("Highlight")
     h.Adornee = target.Parent
     h.FillTransparency = 1
@@ -41,7 +25,6 @@ local function applyHighlight(target)
     h.OutlineColor = Color3.fromRGB(255, 255, 255)
     h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     h.Parent = target.Parent
-
     targetHighlight = h
 end
 
@@ -51,218 +34,102 @@ local function removeHighlight()
         targetHighlight = nil
     end
 end
--- ==================================
 
--- ===== EFFICIENT TARGET CACHING =====
-local function addToCache(root, hum, char)
-    if hum.Health > 0 and root and char then
-        targetCache[root] = {
-            humanoid = hum,
-            character = char
-        }
-    end
-end
-
-local function removeFromCache(root)
-    if targetCache[root] then
-        targetCache[root] = nil
-    end
-end
-
--- OPTIMIZED: Only search for PLAYERS, not every random NPC
-local function initializeCache()
-    if cacheInitialized then return end
-    
-    print("[Lock-On] Building player cache... (fast)")
-    targetCache = {}
-    
-    -- Only cache PLAYERS (super fast, no lag)
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player and plr.Character then
-            local char = plr.Character
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            local root = char:FindFirstChild("HumanoidRootPart")
-            if hum and root then
-                addToCache(root, hum, char)
-            end
-        end
-    end
-    
-    cacheInitialized = true
-    print("[Lock-On] Cache ready! (" .. #Players:GetPlayers()-1 .. " players cached)")
-end
-
--- Auto-add new players instantly (no lag)
-Players.PlayerAdded:Connect(function(newPlayer)
-    newPlayer.CharacterAdded:Connect(function(char)
-        task.wait(0.5)
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        local root = char:FindFirstChild("HumanoidRootPart")
-        if hum and root then
-            addToCache(root, hum, char)
-        end
-    end)
-end)
-
--- Monitor existing players for respawns
-for _, existingPlayer in ipairs(Players:GetPlayers()) do
-    if existingPlayer ~= player then
-        existingPlayer.CharacterAdded:Connect(function(char)
-            task.wait(0.5)
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            local root = char:FindFirstChild("HumanoidRootPart")
-            if hum and root then
-                addToCache(root, hum, char)
-            end
-        end)
-    end
-end
-
--- Clean up when player leaves (no lag)
-Players.PlayerRemoving:Connect(function(leavingPlayer)
-    if leavingPlayer.Character then
-        local root = leavingPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if root then
-            removeFromCache(root)
-        end
-    end
-end)
--- ====================================
-
--- ===== OPTIMIZED TARGET FIND (WITH DISTANCE CULLING) =====
-local function findClosestTarget()
-    if not cacheInitialized then
-        initializeCache()
-    end
-    
-    local cam = workspace.CurrentCamera
+-- ===== FIND CLOSEST TARGET =====
+local function findClosest()
     local mouse = UserInputService:GetMouseLocation()
-    local best, bestDist = nil, math.huge
-    local myPos = hrp.Position
-
-    -- Iterate through dictionary (very fast)
-    for root, data in pairs(targetCache) do
-        -- Quick validity check
-        if root.Parent and data.humanoid.Health > 0 then
-            
-            -- DISTANCE CULLING: Skip if too far (massive performance boost)
-            local distance = (root.Position - myPos).Magnitude
-            if distance <= MAX_TARGET_DISTANCE then
-                
+    local cam = workspace.CurrentCamera
+    local closest, bestDist = nil, math.huge
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local root = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChild("Humanoid")
+            if root and hum and hum.Health > 0 then
                 local pos, onScreen = cam:WorldToViewportPoint(root.Position)
                 if onScreen then
-                    local d = (Vector2.new(pos.X, pos.Y) - mouse).Magnitude
-                    if d < bestDist then
-                        bestDist = d
-                        best = root
+                    local dist = (Vector2.new(pos.X, pos.Y) - mouse).Magnitude
+                    if dist < bestDist then
+                        bestDist = dist
+                        closest = root
                     end
                 end
             end
-        else
-            -- Dead/invalid target - remove from cache immediately
-            removeFromCache(root)
         end
     end
-
-    return best
-end
--- =========================================================
-
-local function isRagdolled()
-    local s = humanoid:GetState()
-    return s == Enum.HumanoidStateType.Ragdoll
-        or s == Enum.HumanoidStateType.Physics
-        or s == Enum.HumanoidStateType.FallingDown
+    return closest
 end
 
-local function validTarget(t)
-    if not t or not t.Parent then return false end
-    local data = targetCache[t]
-    if not data then return false end
-    return data.humanoid.Health > 0
-end
-
--- ===== TRACKING WITH 0.13 PREDICTION =====
-local function updateRotation()
+-- ===== RAW ROTATION - NO BULLSHIT =====
+local function lockRotation()
     if not lockedTarget or not lockedTarget.Parent then return end
     
-    -- Track velocity for prediction
-    local vel = lockedTarget.AssemblyLinearVelocity or Vector3.zero
-    targetVelocity = targetVelocity:Lerp(vel, 2)
+    local targetPos = lockedTarget.Position
+    local myPos = hrp.Position
     
-    -- SERVER POSITION + PREDICTION
-    local predicted = lockedTarget.CFrame.Position + targetVelocity * PREDICTION
-    local dir = predicted - hrp.Position
-    if dir.Magnitude < 0.01 then return end
-
-    -- INSTANT SNAP - HORIZONTAL ONLY
-    local flat = Vector3.new(dir.X, 0, dir.Z)
-    if flat.Magnitude > 0.01 then
-        local _, y, _ = CFrame.lookAt(hrp.Position, hrp.Position + flat):ToOrientation()
-        hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, y, 0)
+    -- Direction (horizontal only)
+    local dir = Vector3.new(targetPos.X - myPos.X, 0, targetPos.Z - myPos.Z)
+    
+    if dir.Magnitude > 0.01 then
+        -- INSTANT SNAP - OVERWRITE EVERYTHING
+        local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
+        hrp.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
     end
 end
--- ==========================================
 
 -- ===== TOGGLE =====
-local function toggleLock()
+local function toggle()
     if isLocked then
         isLocked = false
         lockedTarget = nil
-        humanoid.AutoRotate = originalAutoRotate
+        humanoid.AutoRotate = true
         removeHighlight()
     else
-        local t = findClosestTarget()
-        if t then
+        local target = findClosest()
+        if target then
             isLocked = true
-            lockedTarget = t
-            targetVelocity = t.AssemblyLinearVelocity or Vector3.zero
+            lockedTarget = target
             humanoid.AutoRotate = false
-            lastRelock = tick()
-            applyHighlight(t)
+            applyHighlight(target)
         end
     end
 end
--- ===================
 
-UserInputService.InputBegan:Connect(function(i, gp)
-    if not gp and i.KeyCode == LOCK_KEY then
-        toggleLock()
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed and input.KeyCode == LOCK_KEY then
+        toggle()
     end
 end)
 
--- ===== OPTIMIZED MAIN LOOP (Heartbeat instead of RenderStepped) =====
-RunService.Heartbeat:Connect(function()
-    if not isLocked then return end
-
-    if isRagdolled() then
-        humanoid.AutoRotate = originalAutoRotate
-        removeHighlight()
-        return
-    end
-
-    local now = tick()
-    if now - lastRelock >= RELOCK_INTERVAL then
-        lastRelock = now
+-- ===== MAIN LOOP - PURE OVERRIDE =====
+RunService.RenderStepped:Connect(function()
+    if isLocked then
+        -- FORCE DISABLE AUTO-ROTATE EVERY FRAME
         humanoid.AutoRotate = false
+        
+        -- CHECK TARGET STILL VALID
+        if not lockedTarget or not lockedTarget.Parent then
+            toggle()
+            return
+        end
+        
+        local hum = lockedTarget.Parent:FindFirstChild("Humanoid")
+        if not hum or hum.Health <= 0 then
+            toggle()
+            return
+        end
+        
+        -- LOCK ROTATION - EVERY SINGLE FRAME
+        lockRotation()
     end
-
-    if not validTarget(lockedTarget) then
-        toggleLock()
-        return
-    end
-
-    updateRotation()
 end)
--- =====================================================================
 
 -- ===== RESPAWN =====
-player.CharacterAdded:Connect(function(c)
-    character = c
-    humanoid = c:WaitForChild("Humanoid")
-    hrp = c:WaitForChild("HumanoidRootPart")
-    originalAutoRotate = humanoid.AutoRotate
-    removeHighlight()
+player.CharacterAdded:Connect(function(char)
+    character = char
+    humanoid = char:WaitForChild("Humanoid")
+    hrp = char:WaitForChild("HumanoidRootPart")
     isLocked = false
+    lockedTarget = nil
+    removeHighlight()
 end)
--- ====================
