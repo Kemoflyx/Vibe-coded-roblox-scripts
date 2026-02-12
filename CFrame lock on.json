@@ -1,4 +1,4 @@
--- ULTRA-OPTIMIZED Character Lock-On (ZERO LAG + SERVER POSITION)
+-- ULTRA-OPTIMIZED Character Lock-On (ZERO LAG + 0.13 PREDICTION)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -11,12 +11,14 @@ local hrp = character:WaitForChild("HumanoidRootPart")
 
 -- ===== CONFIG =====
 local LOCK_KEY = Enum.KeyCode.E
+local PREDICTION = 0.13
 local RELOCK_INTERVAL = 0.2
 local MAX_TARGET_DISTANCE = 500 -- Don't check targets further than this (performance)
 -- ==================
 
 -- ===== STATE =====
 local lockedTarget
+local targetVelocity = Vector3.zero
 local isLocked = false
 local originalAutoRotate = humanoid.AutoRotate
 local lastRelock = 0
@@ -180,13 +182,17 @@ local function validTarget(t)
     return data.humanoid.Health > 0
 end
 
--- ===== SERVER POSITION TRACKING =====
+-- ===== TRACKING WITH 0.13 PREDICTION =====
 local function updateRotation()
     if not lockedTarget or not lockedTarget.Parent then return end
     
-    -- SERVER POSITION ONLY
-    local targetPos = lockedTarget.CFrame.Position
-    local dir = targetPos - hrp.Position
+    -- Track velocity for prediction
+    local vel = lockedTarget.AssemblyLinearVelocity or Vector3.zero
+    targetVelocity = targetVelocity:Lerp(vel, 2)
+    
+    -- SERVER POSITION + PREDICTION
+    local predicted = lockedTarget.CFrame.Position + targetVelocity * PREDICTION
+    local dir = predicted - hrp.Position
     if dir.Magnitude < 0.01 then return end
 
     -- INSTANT SNAP - HORIZONTAL ONLY
@@ -196,7 +202,7 @@ local function updateRotation()
         hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, y, 0)
     end
 end
--- ====================================
+-- ==========================================
 
 -- ===== TOGGLE =====
 local function toggleLock()
@@ -210,6 +216,7 @@ local function toggleLock()
         if t then
             isLocked = true
             lockedTarget = t
+            targetVelocity = t.AssemblyLinearVelocity or Vector3.zero
             humanoid.AutoRotate = false
             lastRelock = tick()
             applyHighlight(t)
