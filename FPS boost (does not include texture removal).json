@@ -1,11 +1,4 @@
--- Executor-only
--- Removes dynamic visual effects ONLY
--- Keeps highlights, textures, decals, models, sounds, and render distance intact
-
 local Players = game:GetService("Players")
-
--- ===== EFFECT CLASSES TO REMOVE =====
--- NOTE: Highlight intentionally NOT included
 local EFFECT_CLASSES = {
     ParticleEmitter = true,
     Trail = true,
@@ -16,40 +9,35 @@ local EFFECT_CLASSES = {
     Explosion = true,
 }
 
--- ===== HARD REMOVE (IY METHOD) =====
 local function removeEffect(obj)
-    pcall(function()
+pcall(function()
         obj.Parent = nil
         obj:Destroy()
-    end)
+end)
 end
 
--- ===== INITIAL SWEEP (ONCE) =====
 for _, inst in ipairs(game:GetDescendants()) do
-    if EFFECT_CLASSES[inst.ClassName] then
+if EFFECT_CLASSES[inst.ClassName] then
         removeEffect(inst)
-    end
+end
 end
 
--- ===== FUTURE EFFECTS =====
 game.DescendantAdded:Connect(function(inst)
-    if EFFECT_CLASSES[inst.ClassName] then
+if EFFECT_CLASSES[inst.ClassName] then
         task.defer(removeEffect, inst)
-    end
+end
 end)
 
--- ===== CHARACTER RESPAWN SAFETY =====
 local function cleanCharacter(char)
-    for _, inst in ipairs(char:GetDescendants()) do
-        if EFFECT_CLASSES[inst.ClassName] then
+for _, inst in ipairs(char:GetDescendants()) do
+if EFFECT_CLASSES[inst.ClassName] then
             removeEffect(inst)
-        end
-    end
 end
-
+end
+end
 for _, player in ipairs(Players:GetPlayers()) do
-    if player.Character then
+if player.Character then
         cleanCharacter(player.Character)
-    end
+end
     player.CharacterAdded:Connect(cleanCharacter)
 end
