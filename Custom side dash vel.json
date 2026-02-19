@@ -1,0 +1,146 @@
+if typeof(_G.DashCleanup) == "function" then
+    _G.DashCleanup()
+end
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+
+if not player then
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    player = Players.LocalPlayer
+end
+
+local DASH_DISTANCE = 26.5  -- total studs traveled per dash
+local DASH_DURATION = 0.25  -- seconds the dash lasts
+local DASH_COOLDOWN = 0.45  -- cooldown between dashes in seconds
+
+local heldKeys       = {}
+local isDashing      = false
+local lastDash       = -math.huge
+local savedWalkSpeed = 16
+local connections    = {}
+
+local character, humanoid, rootPart
+
+local function waitForCharacter()
+    local char, hum, root
+    repeat
+        char = player.Character
+        if char then
+            hum  = char:FindFirstChildOfClass("Humanoid")
+            root = char:FindFirstChild("HumanoidRootPart")
+        end
+        if not (char and hum and root) then
+            task.wait()
+        end
+    until char and hum and root
+    return char, hum, root
+end
+
+character, humanoid, rootPart = waitForCharacter()
+
+
+local function doDash(side)
+    if isDashing then return end
+    if os.clock() - lastDash < DASH_COOLDOWN then return end
+    if not humanoid or humanoid.Health <= 0 then return end
+
+    isDashing      = true
+    lastDash       = os.clock()
+    savedWalkSpeed = humanoid.WalkSpeed
+    humanoid.WalkSpeed = 0
+
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(math.huge, 0, math.huge)
+    bv.Velocity  = Vector3.zero
+    bv.Parent    = rootPart
+
+    local elapsed = 0
+    local speed   = DASH_DISTANCE / DASH_DURATION
+    local lastDir = Vector3.zero
+
+    local heartbeat
+    heartbeat = RunService.Heartbeat:Connect(function(dt)
+        elapsed += dt
+
+        if elapsed >= DASH_DURATION or not humanoid or humanoid.Health <= 0 then
+            heartbeat:Disconnect()
+            rootPart.AssemblyLinearVelocity = lastDir * speed * 0.6
+            bv:Destroy()
+            isDashing = false
+            if humanoid then
+                humanoid.WalkSpeed = savedWalkSpeed
+            end
+            return
+        end
+
+        local dir = side == "right" and rootPart.CFrame.RightVector
+                                     or -rootPart.CFrame.RightVector
+        dir = Vector3.new(dir.X, 0, dir.Z).Unit
+        lastDir = dir
+
+        local EASE_IN_END = 0.10
+        local progress    = elapsed / DASH_DURATION
+        local multiplier
+        if progress < EASE_IN_END then
+            local t    = progress / EASE_IN_END
+            multiplier = t * t * (3 - 2 * t)
+        else
+            multiplier = 1
+        end
+
+        local vel   = dir * speed * multiplier
+        bv.Velocity = vel
+
+        rootPart.AssemblyLinearVelocity = Vector3.new(vel.X, rootPart.AssemblyLinearVelocity.Y, vel.Z)
+    end)
+end
+
+local inputBegan = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    local key = input.KeyCode
+
+    if key == Enum.KeyCode.A then heldKeys["A"] = true end
+    if key == Enum.KeyCode.D then heldKeys["D"] = true end
+
+    if key == Enum.KeyCode.Q then
+        if heldKeys["D"] then
+            doDash("right")
+        elseif heldKeys["A"] then
+            doDash("left")
+        end
+    end
+end)
+
+local inputEnded = UserInputService.InputEnded:Connect(function(input, _)
+    local key = input.KeyCode
+    if key == Enum.KeyCode.A then heldKeys["A"] = false end
+    if key == Enum.KeyCode.D then heldKeys["D"] = false end
+end)
+
+local charAdded = player.CharacterAdded:Connect(function(newChar)
+    character = newChar
+    humanoid  = newChar:WaitForChild("Humanoid")
+    rootPart  = newChar:WaitForChild("HumanoidRootPart")
+    isDashing = false
+    heldKeys  = {}
+end)
+
+table.insert(connections, inputBegan)
+table.insert(connections, inputEnded)
+table.insert(connections, charAdded)
+
+_G.DashCleanup = function()
+    for _, conn in ipairs(connections) do
+        conn:Disconnect()
+    end
+    connections = {}
+    isDashing   = false
+    if humanoid then
+        humanoid.WalkSpeed = savedWalkSpeed
+    end
+    _G.DashCleanup = nil
+end
