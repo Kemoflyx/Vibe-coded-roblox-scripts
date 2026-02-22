@@ -1,293 +1,145 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
 local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 local humanoid = character:WaitForChild("Humanoid")
+local camera = workspace.CurrentCamera
 
 local isActive = false
-local currentTarget = nil
+local lastETime = 0 
 
-local DASH_DURATION = 0.3
-local DASH_DURATION_CLOSE = 0.2
-local CLOSE_RANGE_THRESHOLD = 25
+-- ── Settings ─────────────────────────────────────────────────────────────────
 local CIRCLE_RADIUS = 5
-local MAX_LOCK_DISTANCE = 50
+local MAX_LOCK_DISTANCE = 500
+local E_COOLDOWN = 2.0 
 
-local targetCache = {} -- Stores {Root = part, Humanoid = humanoid}
+-- SPEEDS (Studs Per Second)
+local SIDE_SPEED_SPS    = 127 
+local FORWARD_SPEED_SPS = 107  
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local targetCache = {}
 
 local function addToCache(targetCharacter)
-    if targetCharacter == character then return end -- Don't cache yourself
-    
+    if targetCharacter == character then return end 
     local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart") or targetCharacter:FindFirstChild("Torso") or targetCharacter:FindFirstChild("Head")
     local targetHumanoid = targetCharacter:FindFirstChildOfClass("Humanoid")
     
     if targetRoot and targetRoot:IsA("BasePart") and targetHumanoid then
-        local cacheEntry = {
-            Root = targetRoot,
-            Humanoid = targetHumanoid,
-            Character = targetCharacter
-        }
-        
-        targetCache[targetCharacter] = cacheEntry
-
-
-        targetCharacter.AncestryChanged:Connect(function(_, parent)
-            if not parent then
-                targetCache[targetCharacter] = nil
-            end
-        end)
-
-
-        targetHumanoid.Died:Connect(function()
-            -- Keep the entry but mark as dead, will update on respawn
-            if targetCache[targetCharacter] then
-                targetCache[targetCharacter].Dead = true
-            end
-        end)
-        
+        targetCache[targetCharacter] = { Root = targetRoot, Humanoid = targetHumanoid }
         return true
     end
     return false
 end
 
-
-local function removeFromCache(targetCharacter)
-    targetCache[targetCharacter] = nil
-end
-
-
 local function setupPlayerTracking(targetPlayer)
-    if targetPlayer == player then return end -- Don't track yourself
-    
-
-    if targetPlayer.Character then
-        addToCache(targetPlayer.Character)
-    end
-    
-
-    targetPlayer.CharacterAdded:Connect(function(newCharacter)
-
-        for cachedChar, _ in pairs(targetCache) do
-            if cachedChar.Parent == targetPlayer then
-                targetCache[cachedChar] = nil
-            end
-        end
-        
-
-        addToCache(newCharacter)
-    end)
-    
-
-    targetPlayer.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            for cachedChar, _ in pairs(targetCache) do
-                if cachedChar.Parent == targetPlayer then
-                    targetCache[cachedChar] = nil
-                end
-            end
-        end
-    end)
+    if targetPlayer == player then return end
+    if targetPlayer.Character then addToCache(targetPlayer.Character) end
+    targetPlayer.CharacterAdded:Connect(function(newChar) task.wait(0.5) addToCache(newChar) end)
 end
 
+local function getTargetClosestToCursor()
+    local nearestTarget = nil
+    local shortestMouseDist = math.huge
+    local mousePos = UserInputService:GetMouseLocation()
 
-local function searchForNPCsRecursive(parent, depth)
-    depth = depth or 0
-    if depth > 5 then return 0 end -- Prevent infinite recursion
-    
-    local npcCount = 0
-    
-    for _, child in ipairs(parent:GetChildren()) do
-        -- If it's a model with a humanoid, try to cache it
-        if child:IsA("Model") then
-            if addToCache(child) then
-                npcCount = npcCount + 1
-            end
-        end
-        
-
-        if child:IsA("Folder") or child:IsA("Model") then
-            npcCount = npcCount + searchForNPCsRecursive(child, depth + 1)
-        end
-    end
-    
-    return npcCount
-end
-
-
-local function scanForNPCs()
-    local npcCount = 0
-    
-
-    local commonFolderNames = {
-        "NPCs", "Enemies", "Mobs", "Dummies", "Characters", 
-        "Monsters", "Bosses", "Entities", "AI", "Units", "Dummy", "NPC"
-    }
-    
-    for _, folderName in ipairs(commonFolderNames) do
-        local folder = workspace:FindFirstChild(folderName)
-        if folder then
-            local count = searchForNPCsRecursive(folder)
-            npcCount = npcCount + count
-            
-
-            folder.ChildAdded:Connect(function(child)
-                if child:IsA("Model") then
-                    task.wait(0.1) -- Wait for parts to load
-                    addToCache(child)
-                end
-            end)
-        end
-    end
-    
-
-    if npcCount == 0 then
-        for _, child in ipairs(workspace:GetChildren()) do
-            if child:IsA("Model") and child ~= character then
-                local hasHumanoid = child:FindFirstChildOfClass("Humanoid")
-                if hasHumanoid then
-                    if addToCache(child) then
-                        npcCount = npcCount + 1
+    for char, targetData in pairs(targetCache) do
+        if char.Parent and targetData.Humanoid.Health > 0 then
+            local worldDist = (targetData.Root.Position - humanoidRootPart.Position).Magnitude
+            if worldDist <= MAX_LOCK_DISTANCE then
+                local screenPos, onScreen = camera:WorldToViewportPoint(targetData.Root.Position)
+                if onScreen then
+                    local distToCursor = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                    if distToCursor < shortestMouseDist then
+                        shortestMouseDist = distToCursor
+                        nearestTarget = targetData.Root
                     end
                 end
             end
-        end
-        
-
-        workspace.ChildAdded:Connect(function(child)
-            if child:IsA("Model") then
-                task.wait(0.1)
-                local hasHumanoid = child:FindFirstChildOfClass("Humanoid")
-                if hasHumanoid then
-                    addToCache(child)
-                end
-            end
-        end)
+        else targetCache[char] = nil end
     end
-    
-    return npcCount
-end
-
-
-local function simulateDashInput()
-    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.D, false, game)
-    task.wait(0.01)
-    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
-    task.wait(0.05)
-    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
-    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.D, false, game)
-end
-
-
-local function findNearestTarget()
-    local nearestTarget = nil
-    local shortestDistanceSquared = MAX_LOCK_DISTANCE * MAX_LOCK_DISTANCE
-    local myPosition = humanoidRootPart.Position
-    
-
-    for _, targetData in pairs(targetCache) do
-
-        if targetData.Root and targetData.Root.Parent and targetData.Humanoid and targetData.Humanoid.Health > 0 then
-
-            local offset = targetData.Root.Position - myPosition
-            local distanceSquared = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
-            
-            if distanceSquared < shortestDistanceSquared then
-                shortestDistanceSquared = distanceSquared
-                nearestTarget = targetData.Root
-            end
-        end
-    end
-    
     return nearestTarget
 end
 
-
-local function performSideDash()
-    if isActive then return end
+local function performCustomMovement()
+    if isActive or (tick() - lastETime < E_COOLDOWN) then return end
     
-    currentTarget = findNearestTarget()
-    if not currentTarget then
-        return
-    end
+    local target = getTargetClosestToCursor()
+    if not target then return end
     
     isActive = true
+    lastETime = tick() 
     
+    -- Fire Q immediately
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+    task.delay(0.05, function()
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+    end)
 
-    simulateDashInput()
-    
+    local speedSPS = UserInputService:IsKeyDown(Enum.KeyCode.W) and FORWARD_SPEED_SPS or SIDE_SPEED_SPS
 
     local startPos = humanoidRootPart.Position
-    local targetPos = currentTarget.Position
+    local targetPos = target.Position
+    local flattenedTargetPos = Vector3.new(targetPos.X, startPos.Y, targetPos.Z)
     
-
-    local myLookVector = humanoidRootPart.CFrame.LookVector
-    local myRightVector = Vector3.new(-myLookVector.Z, 0, myLookVector.X).Unit
+    local dirToTarget = (flattenedTargetPos - startPos).Unit
+    local baseSideVector = dirToTarget:Cross(Vector3.new(0, 1, 0)).Unit 
     
-
-    local targetSidePosition = targetPos + myRightVector * CIRCLE_RADIUS
+    local sideMultiplier = UserInputService:IsKeyDown(Enum.KeyCode.A) and -1 or 1
+    local targetSidePosition = flattenedTargetPos + (baseSideVector * sideMultiplier * CIRCLE_RADIUS)
     
-
-    local offset = targetSidePosition - startPos
-    local distance = math.sqrt(offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z)
-    local adjustedDuration = distance < CLOSE_RANGE_THRESHOLD and DASH_DURATION_CLOSE or DASH_DURATION
-    
+    local distance = (targetSidePosition - startPos).Magnitude
+    local finalDuration = distance / speedSPS
 
     local startCFrame = humanoidRootPart.CFrame
-    local goalCFrame = CFrame.new(targetSidePosition) * (startCFrame - startCFrame.Position)
+    local goalCFrame = CFrame.new(targetSidePosition, flattenedTargetPos)
     
-
-    local originalWalkSpeed = humanoid.WalkSpeed
-    humanoid.WalkSpeed = 0
-    
-
     local startTime = tick()
     local connection
-    
     connection = RunService.Heartbeat:Connect(function()
         local elapsed = tick() - startTime
-        local progress = math.min(elapsed / adjustedDuration, 1)
+        local progress = math.min(elapsed / finalDuration, 1)
         
-
-        local alpha = 1 - (1 - progress) * (1 - progress)
+        -- Quad Out for snappy start
+        local alpha = progress * (2 - progress)
+        local currentLerp = startCFrame:Lerp(goalCFrame, alpha)
         
-
-        humanoidRootPart.CFrame = startCFrame:Lerp(goalCFrame, alpha)
-        
-        if progress >= 1 then
+        -- ── THE "NO HOLD BACK" FIX ──
+        -- We release control at 95%. This prevents the CFrame from 
+        -- "locking" you in place at the destination while the 
+        -- underlying dash is still trying to move you.
+        if progress >= 0.95 then
             connection:Disconnect()
-            humanoid.WalkSpeed = originalWalkSpeed
             isActive = false
+            return
         end
+        
+        humanoidRootPart.CFrame = CFrame.new(
+            currentLerp.Position.X, 
+            startPos.Y, 
+            currentLerp.Position.Z
+        ) * currentLerp.Rotation
     end)
 end
 
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    
-    if input.KeyCode == Enum.KeyCode.E then
-        performSideDash()
-    end
+-- ── Listeners ────────────────────────────────────────────────────────────────
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.E then performCustomMovement() end
 end)
 
-player.CharacterAdded:Connect(function(newCharacter)
-    character = newCharacter
-    humanoidRootPart = character:WaitForChild("HumanoidRootPart")
-    humanoid = character:WaitForChild("Humanoid")
-    isActive = false
+player.CharacterAdded:Connect(function(newChar)
+    character = newChar
+    humanoid = newChar:WaitForChild("Humanoid")
+    humanoidRootPart = newChar:WaitForChild("HumanoidRootPart")
 end)
 
-for _, otherPlayer in ipairs(Players:GetPlayers()) do
-    setupPlayerTracking(otherPlayer)
-end
-
-
-Players.PlayerAdded:Connect(function(newPlayer)
-    setupPlayerTracking(newPlayer)
-end)
-
-scanForNPCs()
+Players.PlayerAdded:Connect(setupPlayerTracking)
+for _, otherPlayer in ipairs(Players:GetPlayers()) do setupPlayerTracking(otherPlayer) end
+workspace.DescendantAdded:Connect(function(desc) if desc:IsA("Humanoid") then task.wait(0.5) addToCache(desc.Parent) end end)
+for _, child in ipairs(workspace:GetDescendants()) do if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then addToCache(child) end end
