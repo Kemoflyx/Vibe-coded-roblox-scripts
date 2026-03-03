@@ -5,18 +5,26 @@ local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local player     = Players.LocalPlayer
 
-local COOLDOWN     = 2    -- normal side dash cooldown
-local COOLDOWN_W   = 7    -- W front dash cooldown
-local MAX_RANGE    = 30   -- normal side dash range
-local MAX_RANGE_W  = 35   -- W front dash range
-local DASH_SPEED   = 115  -- normal side arch speed
-local DASH_SPEED_W = 90   -- W held front dash speed
-local STEPS        = 20
-local DIR_LOOKAHEAD = 0.10
+-- Tunable values
+local COOLDOWN         = 2      -- normal side dash cooldown (seconds)
+local COOLDOWN_W       = 7      -- W front dash cooldown (seconds)
+local MAX_RANGE        = 30     -- normal side dash max target range (studs)
+local MAX_RANGE_W      = 35     -- W front dash max target range (studs)
+local DASH_SPEED       = 115    -- normal side arch movement speed
+local DASH_SPEED_W     = 100    -- W held front dash movement speed
+local STEPS            = 20     -- arc resolution (higher = smoother curve)
+local DIR_LOOKAHEAD    = 0.10   -- prediction window for tween destination and facing (seconds)
+local FACING_LINGER    = 1      -- how long character keeps facing target after dash (seconds)
+local ARCH_WIDTH_MIN   = 6      -- minimum side dash arc width (studs)
+local ARCH_WIDTH_MAX   = 14     -- maximum side dash arc width at full range (studs)
+local ARCH_OVERSHOOT   = 4      -- how far past target the arc endpoint extends (studs)
+local W_SIDE_OFFSET    = 4.5    -- W dash lateral offset from target (studs)
+local W_FORWARD_OFFSET = 1      -- W dash forward offset past target (studs)
+
 local onCooldown  = false
 local onCooldownW = false
 
--- ── Cleanup previous instance on re-execute ───────────────────────────────────
+-- Cleanup previous instance on re-execute
 if _G.__dashCleanup then _G.__dashCleanup() end
 local cleanupTasks = {}
 local activeConns  = {}
@@ -30,7 +38,7 @@ _G.__dashCleanup = function()
 	_G.__dashCleanup = nil
 end
 
--- ── Target cache ──────────────────────────────────────────────────────────────
+-- Target cache
 local targetCache = {}
 local playerConns = {}
 local diedConns   = {}
@@ -40,7 +48,7 @@ local function addModel(model)
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	if hrp and hum then
-		targetCache[model] = { Root = hrp, Humanoid = hum }
+		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero }
 		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
 		table.insert(diedConns, dc)
 	end
@@ -104,7 +112,29 @@ onCleanup(function()
 	diedConns = {}
 end)
 
--- ── Helpers ───────────────────────────────────────────────────────────────────
+-- Velocity tracker (Stepped = pre-interpolation, raw server-replicated positions)
+local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
+	if dt <= 0 then return end
+	for _, data in pairs(targetCache) do
+		local curPos = data.Root.Position
+		data.velocity = (curPos - data.prevPos) / dt
+		data.prevPos  = curPos
+	end
+end))
+onCleanup(function() velTracker:Disconnect() end)
+
+-- Returns predicted position DIR_LOOKAHEAD seconds ahead, XZ only
+local function getPredictedPos(targetRoot)
+	for _, data in pairs(targetCache) do
+		if data.Root == targetRoot then
+			local vel = data.velocity
+			return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
+		end
+	end
+	return targetRoot.Position
+end
+
+-- Helpers
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
@@ -159,23 +189,23 @@ local function getTarget(root, range)
 	return closest
 end
 
--- Exact facing method from lock script
+-- Facing aims at predicted position
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
-	local myPos = root.Position
-	local dir   = Vector3.new(targetRoot.Position.X - myPos.X, 0, targetRoot.Position.Z - myPos.Z)
+	local myPos  = root.Position
+	local aimPos = getPredictedPos(targetRoot)
+	local dir    = Vector3.new(aimPos.X - myPos.X, 0, aimPos.Z - myPos.Z)
 	if dir.Magnitude > 0.01 then
 		local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
 		root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
 	end
 end
 
--- ── Dash ──────────────────────────────────────────────────────────────────────
+-- Dash
 local function activate()
 	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
 	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
 
-	-- S held: face target for 1 second, triggers Q
 	if holdingS then
 		local char = getCharacter()
 		local root = char:FindFirstChild("HumanoidRootPart")
@@ -188,7 +218,7 @@ local function activate()
 		local startTime = tick()
 		local conn
 		conn = trackActive(RunService.RenderStepped:Connect(function()
-			if tick() - startTime >= 1 then
+			if tick() - startTime >= FACING_LINGER then
 				conn:Disconnect()
 				if hum then hum.AutoRotate = true end
 				return
@@ -208,8 +238,10 @@ local function activate()
 	if holdingW then onCooldownW = true else onCooldown = true end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 
+	-- Tween destination uses predicted position
+	local rawTargetPos  = getPredictedPos(target)
 	local startPos      = root.Position
-	local targetPos     = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
+	local targetPos     = Vector3.new(rawTargetPos.X, startPos.Y, rawTargetPos.Z)
 	local toTarget      = (targetPos - startPos).Unit
 	local distance      = (targetPos - startPos).Magnitude
 	local perp          = Vector3.new(-toTarget.Z, 0, toTarget.X)
@@ -228,7 +260,7 @@ local function activate()
 	local connection
 
 	if holdingW then
-		local finalPos = targetPos + perp * sideDirection * 4.5 + toTarget * 1
+		local finalPos = targetPos + perp * sideDirection * W_SIDE_OFFSET + toTarget * W_FORWARD_OFFSET
 		local totalLen = (finalPos - startPos).Magnitude
 		local moveDir  = (finalPos - startPos).Unit
 		if hum then hum.AutoRotate = false end
@@ -241,13 +273,14 @@ local function activate()
 				local lingerConn
 				lingerConn = trackActive(RunService.RenderStepped:Connect(function(ldt)
 					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= 1 then
+					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
 						if hum then hum.AutoRotate = true end
 						return
 					end
-					local myPos = root.Position
-					local dir2  = Vector3.new(target.Position.X - myPos.X, 0, target.Position.Z - myPos.Z)
+					local myPos  = root.Position
+					local aimPos = getPredictedPos(target)
+					local dir2   = Vector3.new(aimPos.X - myPos.X, 0, aimPos.Z - myPos.Z)
 					if dir2.Magnitude > 0.01 then
 						currentDir = currentDir:Lerp(dir2.Unit, 1 - (0.0001 ^ ldt))
 						local lookCFrame = CFrame.lookAt(myPos, myPos + currentDir)
@@ -263,8 +296,8 @@ local function activate()
 			)
 		end))
 	else
-		local archWidth = 6 + (distance / MAX_RANGE) * 8
-		local finalPos  = targetPos + toTarget * 4
+		local archWidth = ARCH_WIDTH_MIN + (distance / MAX_RANGE) * (ARCH_WIDTH_MAX - ARCH_WIDTH_MIN)
+		local finalPos  = targetPos + toTarget * ARCH_OVERSHOOT
 		local midpoint  = (startPos + finalPos) / 2 + perp * archWidth * sideDirection
 		local arcTable, totalLen = buildArcTable(startPos, midpoint, finalPos)
 		local facingConn
@@ -279,7 +312,7 @@ local function activate()
 				local lingerConn
 				lingerConn = trackActive(RunService.RenderStepped:Connect(function()
 					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= 1 then
+					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
 						if hum then hum.AutoRotate = true end
 						return
