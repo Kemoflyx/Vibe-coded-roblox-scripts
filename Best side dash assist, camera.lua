@@ -52,7 +52,7 @@ local function addModel(model)
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	if hrp and hum then
-		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero }
+		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
 		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
 		table.insert(diedConns, dc)
 	end
@@ -124,8 +124,9 @@ local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	for _, data in pairs(targetCache) do
 		local curPos  = data.Root.Position
 		local rawVel  = (curPos - data.prevPos) / dt
-		data.velocity = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
-		data.prevPos  = curPos
+		data.velocity    = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
+		data.smoothedPos = data.smoothedPos:Lerp(curPos, 0.35)  -- smooths out network interpolation noise
+		data.prevPos     = curPos
 	end
 end))
 onCleanup(function() velTracker:Disconnect() end)
@@ -136,6 +137,16 @@ local function getPredictedPos(targetRoot)
 		if data.Root == targetRoot then
 			local vel = data.velocity
 			return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
+		end
+	end
+	return targetRoot.Position
+end
+
+-- Returns the smoothed position of a target root, damping network interpolation noise
+local function getSmoothedPos(targetRoot)
+	for _, data in pairs(targetCache) do
+		if data.Root == targetRoot then
+			return data.smoothedPos
 		end
 	end
 	return targetRoot.Position
@@ -200,8 +211,9 @@ end
 -- not per-frame facing (per-frame prediction causes jitter as velocity fluctuates)
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
-	local myPos = root.Position
-	local dir   = Vector3.new(targetRoot.Position.X - myPos.X, 0, targetRoot.Position.Z - myPos.Z)
+	local myPos    = root.Position
+	local smoothed = getSmoothedPos(targetRoot)
+	local dir      = Vector3.new(smoothed.X - myPos.X, 0, smoothed.Z - myPos.Z)
 	if dir.Magnitude > 0.01 then
 		local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
 		root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
@@ -211,36 +223,53 @@ end
 
 -- Camera Lock
 local function startCameraLock(root, target)
-	local startTime = tick()
-	local unlocked  = false
-	local conn
+	local startTime   = tick()
+	local unlocked    = false
+	local conns       = {}
+	local localCamPos = root.CFrame:PointToObjectSpace(camera.CFrame.Position)
 
 	local function doUnlock()
 		if unlocked then return end
 		unlocked = true
-		conn:Disconnect()
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+		camera.CameraType = Enum.CameraType.Custom
 	end
 
-	-- PreRender fires after ALL BindToRenderStep calls including Roblox's own camera module,
-	-- so we get the absolute last write on camera.CFrame with nothing able to overwrite us.
-	conn = trackActive(RunService.PreRender:Connect(function()
-		if tick() - startTime >= CAM_LOCK_DURATION then
-			doUnlock()
-			return
-		end
-		local hum    = target.Parent and target.Parent:FindFirstChildOfClass("Humanoid")
-		local hipH   = hum and hum.HipHeight or 2.35
-		local footY  = target.Position.Y - hipH - (target.Size.Y / 2)
-		local aimY   = footY + hipH * CAM_AIM_HEIGHT
-		local aimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
-		           + camera.CFrame.RightVector * CAM_RIGHT_OFFSET
-		camera.CFrame = CFrame.lookAt(camera.CFrame.Position, aimPos)
-	end))
+	-- Snapshot aimY once so camera ignores vertical movement of target
+	local snapTarget = getSmoothedPos(target)
+	local snapHum    = target.Parent and target.Parent:FindFirstChildOfClass("Humanoid")
+	local snapHipH   = snapHum and snapHum.HipHeight or 2.35
+	local fixedAimY  = (snapTarget.Y - snapHipH - (target.Size.Y / 2)) + snapHipH * CAM_AIM_HEIGHT
+
+	local function applyLock()
+		local camPos = root.CFrame:PointToWorldSpace(localCamPos)
+		local sp     = getSmoothedPos(target)
+		-- Use fixedAimY so camera doesn't bob up/down when target jumps or falls
+		local aimPos = Vector3.new(sp.X, fixedAimY, sp.Z)
+		           + root.CFrame.RightVector * CAM_RIGHT_OFFSET
+		camera.CFrame = CFrame.lookAt(camPos, aimPos)
+	end
+
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	-- Write on EVERY stage of the frame so no matter when the game reads
+	-- camera.CFrame.LookVector (InputBegan, Stepped, Heartbeat, or PreRender),
+	-- it always sees the locked direction. Same coverage as applyFacing on root.CFrame.
+	table.insert(conns, trackActive(RunService.Stepped:Connect(function(_, dt)
+		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		applyLock()
+	end)))
+	table.insert(conns, trackActive(RunService.Heartbeat:Connect(function()
+		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		applyLock()
+	end)))
+	table.insert(conns, trackActive(RunService.PreRender:Connect(function()
+		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		applyLock()
+	end)))
 
 	return doUnlock
-end
-
--- Dash
+end-- Dash
 local function activate()
 	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
 	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
@@ -349,6 +378,9 @@ local function activate()
 			if traveled >= totalLen then
 				connection:Disconnect()
 				facingConn:Disconnect()
+				-- Cancel dash-phase lock and start a fresh one seamlessly for linger
+				unlockCam()
+				unlockCam = startCameraLock(root, target)
 				local lingerStart = tick()
 				local lingerConn
 				lingerConn = trackActive(RunService.PreRender:Connect(function()
@@ -360,7 +392,6 @@ local function activate()
 					end
 					applyFacing(root, hum, target)
 				end))
-				local lingerCamUnlock = startCameraLock(root, target)
 				return
 			end
 			traveled = traveled + speed * dt
