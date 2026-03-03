@@ -6,28 +6,29 @@ local VIM        = game:GetService("VirtualInputManager")
 local player     = Players.LocalPlayer
 local camera     = workspace.CurrentCamera
 
--- ── Tunable values ────────────────────────────────────────────────────────────
-local COOLDOWN          = 2      -- normal side dash cooldown (seconds)
-local COOLDOWN_W        = 7      -- W front dash cooldown (seconds)
-local MAX_RANGE         = 30     -- normal side dash max target range (studs)
-local MAX_RANGE_W       = 35     -- W front dash max target range (studs)
-local DASH_SPEED        = 115    -- normal side arch movement speed
-local DASH_SPEED_W      = 100    -- W held front dash movement speed
-local STEPS             = 20     -- arc resolution (higher = smoother curve)
+-- Tunable values
+local COOLDOWN         = 2      -- normal side dash cooldown (seconds)
+local COOLDOWN_W       = 7      -- W front dash cooldown (seconds)
+local MAX_RANGE        = 30     -- normal side dash max target range (studs)
+local MAX_RANGE_W      = 35     -- W front dash max target range (studs)
+local DASH_SPEED       = 115    -- normal side arch movement speed
+local DASH_SPEED_W     = 100    -- W held front dash movement speed
+local STEPS            = 20     -- arc resolution (higher = smoother curve)
+local DIR_LOOKAHEAD    = 0.10   -- prediction window for tween destination and facing (seconds)
+local FACING_LINGER    = 1      -- how long character keeps facing target after dash (seconds)
+local ARCH_WIDTH_MIN   = 6      -- minimum side dash arc width (studs)
+local ARCH_WIDTH_MAX   = 14     -- maximum side dash arc width at full range (studs)
+local ARCH_OVERSHOOT   = 4      -- how far past target the arc endpoint extends (studs)
+local W_SIDE_OFFSET    = 4.5    -- W dash lateral offset from target (studs)
+local W_FORWARD_OFFSET = 1      -- W dash forward offset past target (studs)
 local CAM_LOCK_DURATION = 0.55   -- how long camera stares at target (seconds)
 local CAM_RIGHT_OFFSET  = 1.5    -- aim point shifted to your right (studs)
 local CAM_AIM_HEIGHT    = 0.3    -- aim height: fraction of HipHeight above feet (0=feet, 1=hip, 2=head)
-local FACING_LINGER     = 1      -- how long character keeps facing target after dash (seconds)
-local ARCH_WIDTH_MIN    = 6      -- minimum side dash arc width (studs)
-local ARCH_WIDTH_MAX    = 14     -- maximum side dash arc width at full range (studs)
-local ARCH_OVERSHOOT    = 4      -- how far past target the arc endpoint extends (studs)
-local W_SIDE_OFFSET     = 4.5    -- W dash lateral offset from target (studs)
-local W_FORWARD_OFFSET  = 1      -- W dash forward offset past target (studs)
--- ─────────────────────────────────────────────────────────────────────────────
 
 local onCooldown  = false
 local onCooldownW = false
 
+-- Cleanup previous instance on re-execute
 if _G.__dashCleanup then _G.__dashCleanup() end
 local cleanupTasks = {}
 local activeConns  = {}
@@ -41,6 +42,7 @@ _G.__dashCleanup = function()
 	_G.__dashCleanup = nil
 end
 
+-- Target cache
 local targetCache = {}
 local playerConns = {}
 local diedConns   = {}
@@ -50,7 +52,7 @@ local function addModel(model)
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	if hrp and hum then
-		targetCache[model] = { Root = hrp, Humanoid = hum }
+		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero }
 		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
 		table.insert(diedConns, dc)
 	end
@@ -114,6 +116,32 @@ onCleanup(function()
 	diedConns = {}
 end)
 
+-- Velocity tracker: exponential moving average smooths out per-frame noise
+-- so prediction and facing don't jitter when the target's replicated position twitches
+local VEL_SMOOTH = 0.15  -- lower = smoother but more lag, higher = more reactive
+local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
+	if dt <= 0 then return end
+	for _, data in pairs(targetCache) do
+		local curPos  = data.Root.Position
+		local rawVel  = (curPos - data.prevPos) / dt
+		data.velocity = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
+		data.prevPos  = curPos
+	end
+end))
+onCleanup(function() velTracker:Disconnect() end)
+
+-- Returns predicted position DIR_LOOKAHEAD seconds ahead, XZ only
+local function getPredictedPos(targetRoot)
+	for _, data in pairs(targetCache) do
+		if data.Root == targetRoot then
+			local vel = data.velocity
+			return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
+		end
+	end
+	return targetRoot.Position
+end
+
+-- Helpers
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
@@ -168,6 +196,8 @@ local function getTarget(root, range)
 	return closest
 end
 
+-- Facing uses real position — prediction is only for the one-time tween destination,
+-- not per-frame facing (per-frame prediction causes jitter as velocity fluctuates)
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
 	local myPos = root.Position
@@ -178,17 +208,22 @@ local function applyFacing(root, hum, targetRoot)
 	end
 end
 
+
+-- Camera Lock
 local function startCameraLock(root, target)
 	local startTime = tick()
 	local unlocked  = false
+	local conn
 
 	local function doUnlock()
 		if unlocked then return end
 		unlocked = true
-		RunService:UnbindFromRenderStep("__dashCamLock")
+		conn:Disconnect()
 	end
 
-	RunService:BindToRenderStep("__dashCamLock", Enum.RenderPriority.Camera.Value + 1, function()
+	-- PreRender fires after ALL BindToRenderStep calls including Roblox's own camera module,
+	-- so we get the absolute last write on camera.CFrame with nothing able to overwrite us.
+	conn = trackActive(RunService.PreRender:Connect(function()
 		if tick() - startTime >= CAM_LOCK_DURATION then
 			doUnlock()
 			return
@@ -198,13 +233,14 @@ local function startCameraLock(root, target)
 		local footY  = target.Position.Y - hipH - (target.Size.Y / 2)
 		local aimY   = footY + hipH * CAM_AIM_HEIGHT
 		local aimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
-		             + camera.CFrame.RightVector * CAM_RIGHT_OFFSET
+		           + camera.CFrame.RightVector * CAM_RIGHT_OFFSET
 		camera.CFrame = CFrame.lookAt(camera.CFrame.Position, aimPos)
-	end)
+	end))
 
 	return doUnlock
 end
 
+-- Dash
 local function activate()
 	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
 	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
@@ -220,7 +256,7 @@ local function activate()
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 		local startTime = tick()
 		local conn
-		conn = trackActive(RunService.RenderStepped:Connect(function()
+		conn = trackActive(RunService.PreRender:Connect(function()
 			if tick() - startTime >= FACING_LINGER then
 				conn:Disconnect()
 				if hum then hum.AutoRotate = true end
@@ -242,8 +278,10 @@ local function activate()
 	if holdingW then onCooldownW = true else onCooldown = true end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 
+	-- Tween destination uses predicted position
+	local rawTargetPos  = getPredictedPos(target)
 	local startPos      = root.Position
-	local targetPos     = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
+	local targetPos     = Vector3.new(rawTargetPos.X, startPos.Y, rawTargetPos.Z)
 	local toTarget      = (targetPos - startPos).Unit
 	local distance      = (targetPos - startPos).Magnitude
 	local perp          = Vector3.new(-toTarget.Z, 0, toTarget.X)
@@ -273,7 +311,7 @@ local function activate()
 				local lingerStart = tick()
 				local currentDir  = root.CFrame.LookVector
 				local lingerConn
-				lingerConn = trackActive(RunService.RenderStepped:Connect(function(ldt)
+				lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
@@ -302,20 +340,18 @@ local function activate()
 		local finalPos  = targetPos + toTarget * ARCH_OVERSHOOT
 		local midpoint  = (startPos + finalPos) / 2 + perp * archWidth * sideDirection
 		local arcTable, totalLen = buildArcTable(startPos, midpoint, finalPos)
-
 		local facingConn
-		facingConn = trackActive(RunService.RenderStepped:Connect(function()
+		facingConn = trackActive(RunService.PreRender:Connect(function()
 			applyFacing(root, hum, target)
 		end))
 		local unlockCam = startCameraLock(root, target)
-
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
 			if traveled >= totalLen then
 				connection:Disconnect()
 				facingConn:Disconnect()
 				local lingerStart = tick()
 				local lingerConn
-				lingerConn = trackActive(RunService.RenderStepped:Connect(function()
+				lingerConn = trackActive(RunService.PreRender:Connect(function()
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
