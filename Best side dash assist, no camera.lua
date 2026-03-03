@@ -112,12 +112,15 @@ onCleanup(function()
 	diedConns = {}
 end)
 
--- Velocity tracker (Stepped = pre-interpolation, raw server-replicated positions)
+-- Velocity tracker: exponential moving average smooths out per-frame noise
+-- so prediction and facing don't jitter when the target's replicated position twitches
+local VEL_SMOOTH = 0.15  -- lower = smoother but more lag, higher = more reactive
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	if dt <= 0 then return end
 	for _, data in pairs(targetCache) do
-		local curPos = data.Root.Position
-		data.velocity = (curPos - data.prevPos) / dt
+		local curPos  = data.Root.Position
+		local rawVel  = (curPos - data.prevPos) / dt
+		data.velocity = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
 		data.prevPos  = curPos
 	end
 end))
@@ -189,12 +192,12 @@ local function getTarget(root, range)
 	return closest
 end
 
--- Facing aims at predicted position
+-- Facing uses real position — prediction is only for the one-time tween destination,
+-- not per-frame facing (per-frame prediction causes jitter as velocity fluctuates)
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
-	local myPos  = root.Position
-	local aimPos = getPredictedPos(targetRoot)
-	local dir    = Vector3.new(aimPos.X - myPos.X, 0, aimPos.Z - myPos.Z)
+	local myPos = root.Position
+	local dir   = Vector3.new(targetRoot.Position.X - myPos.X, 0, targetRoot.Position.Z - myPos.Z)
 	if dir.Magnitude > 0.01 then
 		local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
 		root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
@@ -278,9 +281,8 @@ local function activate()
 						if hum then hum.AutoRotate = true end
 						return
 					end
-					local myPos  = root.Position
-					local aimPos = getPredictedPos(target)
-					local dir2   = Vector3.new(aimPos.X - myPos.X, 0, aimPos.Z - myPos.Z)
+					local myPos = root.Position
+					local dir2  = Vector3.new(target.Position.X - myPos.X, 0, target.Position.Z - myPos.Z)
 					if dir2.Magnitude > 0.01 then
 						currentDir = currentDir:Lerp(dir2.Unit, 1 - (0.0001 ^ ldt))
 						local lookCFrame = CFrame.lookAt(myPos, myPos + currentDir)
