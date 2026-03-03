@@ -6,18 +6,28 @@ local VIM        = game:GetService("VirtualInputManager")
 local player     = Players.LocalPlayer
 local camera     = workspace.CurrentCamera
 
-local COOLDOWN     = 2    -- normal side dash cooldown
-local COOLDOWN_W   = 7    -- W front dash cooldown
-local MAX_RANGE    = 30   -- normal side dash range
-local MAX_RANGE_W  = 35   -- W front dash range
-local DASH_SPEED   = 115  -- normal side arch speed
-local DASH_SPEED_W = 90   -- W held front dash speed
-local STEPS        = 20
-local DIR_LOOKAHEAD = 0.10
+-- ── Tunable values ────────────────────────────────────────────────────────────
+local COOLDOWN          = 2      -- normal side dash cooldown (seconds)
+local COOLDOWN_W        = 7      -- W front dash cooldown (seconds)
+local MAX_RANGE         = 30     -- normal side dash max target range (studs)
+local MAX_RANGE_W       = 35     -- W front dash max target range (studs)
+local DASH_SPEED        = 115    -- normal side arch movement speed
+local DASH_SPEED_W      = 100    -- W held front dash movement speed
+local STEPS             = 20     -- arc resolution (higher = smoother curve)
+local CAM_LOCK_DURATION = 0.55   -- how long camera stares at target (seconds)
+local CAM_RIGHT_OFFSET  = 1.5    -- aim point shifted to your right (studs)
+local CAM_AIM_HEIGHT    = 0.3    -- aim height: fraction of HipHeight above feet (0=feet, 1=hip, 2=head)
+local FACING_LINGER     = 1      -- how long character keeps facing target after dash (seconds)
+local ARCH_WIDTH_MIN    = 6      -- minimum side dash arc width (studs)
+local ARCH_WIDTH_MAX    = 14     -- maximum side dash arc width at full range (studs)
+local ARCH_OVERSHOOT    = 4      -- how far past target the arc endpoint extends (studs)
+local W_SIDE_OFFSET     = 4.5    -- W dash lateral offset from target (studs)
+local W_FORWARD_OFFSET  = 1      -- W dash forward offset past target (studs)
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local onCooldown  = false
 local onCooldownW = false
 
--- ── Cleanup previous instance on re-execute ───────────────────────────────────
 if _G.__dashCleanup then _G.__dashCleanup() end
 local cleanupTasks = {}
 local activeConns  = {}
@@ -31,7 +41,6 @@ _G.__dashCleanup = function()
 	_G.__dashCleanup = nil
 end
 
--- ── Target cache ──────────────────────────────────────────────────────────────
 local targetCache = {}
 local playerConns = {}
 local diedConns   = {}
@@ -105,7 +114,6 @@ onCleanup(function()
 	diedConns = {}
 end)
 
--- ── Helpers ───────────────────────────────────────────────────────────────────
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
@@ -160,7 +168,6 @@ local function getTarget(root, range)
 	return closest
 end
 
--- Exact facing method from lock script
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
 	local myPos = root.Position
@@ -171,34 +178,37 @@ local function applyFacing(root, hum, targetRoot)
 	end
 end
 
--- ── Camera Lock ───────────────────────────────────────────────────────────────
--- Locks the camera so it follows the character's facing direction.
--- Captures the camera's current offset relative to the character's CFrame,
--- then keeps that offset updated every RenderStepped as the character rotates.
--- Returns an unlock function that restores CameraType = Custom immediately.
-local function startCameraLock(root)
-	camera.CameraType = Enum.CameraType.Scriptable
-	-- Store the camera's position/orientation in root's local space at lock time.
-	-- As root.CFrame changes (character faces target), camera.CFrame = root.CFrame * camOffset
-	-- will rotate the camera around the character to always stay "behind" it.
-	local camOffset = root.CFrame:ToObjectSpace(camera.CFrame)
+local function startCameraLock(root, target)
+	local startTime = tick()
+	local unlocked  = false
 
-	local conn = trackActive(RunService.RenderStepped:Connect(function()
-		camera.CFrame = root.CFrame * camOffset
-	end))
-
-	return function()
-		conn:Disconnect()
-		camera.CameraType = Enum.CameraType.Custom
+	local function doUnlock()
+		if unlocked then return end
+		unlocked = true
+		RunService:UnbindFromRenderStep("__dashCamLock")
 	end
+
+	RunService:BindToRenderStep("__dashCamLock", Enum.RenderPriority.Camera.Value + 1, function()
+		if tick() - startTime >= CAM_LOCK_DURATION then
+			doUnlock()
+			return
+		end
+		local hum    = target.Parent and target.Parent:FindFirstChildOfClass("Humanoid")
+		local hipH   = hum and hum.HipHeight or 2.35
+		local footY  = target.Position.Y - hipH - (target.Size.Y / 2)
+		local aimY   = footY + hipH * CAM_AIM_HEIGHT
+		local aimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
+		             + camera.CFrame.RightVector * CAM_RIGHT_OFFSET
+		camera.CFrame = CFrame.lookAt(camera.CFrame.Position, aimPos)
+	end)
+
+	return doUnlock
 end
 
--- ── Dash ──────────────────────────────────────────────────────────────────────
 local function activate()
 	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
 	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
 
-	-- S held: face target for 1 second, triggers Q
 	if holdingS then
 		local char = getCharacter()
 		local root = char:FindFirstChild("HumanoidRootPart")
@@ -208,22 +218,17 @@ local function activate()
 		local hum = char:FindFirstChildOfClass("Humanoid")
 		press(Enum.KeyCode.Q)
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
-
-		-- Lock camera to character facing for the full 1-second window
-		local unlockCam = startCameraLock(root)
-
 		local startTime = tick()
 		local conn
 		conn = trackActive(RunService.RenderStepped:Connect(function()
-			if tick() - startTime >= 1 then
+			if tick() - startTime >= FACING_LINGER then
 				conn:Disconnect()
-				-- Unlock camera and AutoRotate at the exact same moment
-				unlockCam()
 				if hum then hum.AutoRotate = true end
 				return
 			end
 			applyFacing(root, hum, target)
 		end))
+		local unlockCam = startCameraLock(root, target)
 		return
 	end
 
@@ -257,7 +262,7 @@ local function activate()
 	local connection
 
 	if holdingW then
-		local finalPos = targetPos + perp * sideDirection * 4.5 + toTarget * 1
+		local finalPos = targetPos + perp * sideDirection * W_SIDE_OFFSET + toTarget * W_FORWARD_OFFSET
 		local totalLen = (finalPos - startPos).Magnitude
 		local moveDir  = (finalPos - startPos).Unit
 		if hum then hum.AutoRotate = false end
@@ -267,17 +272,11 @@ local function activate()
 				connection:Disconnect()
 				local lingerStart = tick()
 				local currentDir  = root.CFrame.LookVector
-
-				-- Lock camera at the moment the linger/facing begins
-				local unlockCam = startCameraLock(root)
-
 				local lingerConn
 				lingerConn = trackActive(RunService.RenderStepped:Connect(function(ldt)
 					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= 1 then
+					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
-						-- Unlock camera and AutoRotate at the exact same moment
-						unlockCam()
 						if hum then hum.AutoRotate = true end
 						return
 					end
@@ -289,6 +288,7 @@ local function activate()
 						root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
 					end
 				end))
+				local unlockCam = startCameraLock(root, target)
 				return
 			end
 			local pos = startPos + moveDir * traveled
@@ -298,18 +298,17 @@ local function activate()
 			)
 		end))
 	else
-		local archWidth = 6 + (distance / MAX_RANGE) * 8
-		local finalPos  = targetPos + toTarget * 4
+		local archWidth = ARCH_WIDTH_MIN + (distance / MAX_RANGE) * (ARCH_WIDTH_MAX - ARCH_WIDTH_MIN)
+		local finalPos  = targetPos + toTarget * ARCH_OVERSHOOT
 		local midpoint  = (startPos + finalPos) / 2 + perp * archWidth * sideDirection
 		local arcTable, totalLen = buildArcTable(startPos, midpoint, finalPos)
-
-		-- Lock camera for the full normal dash + linger window (facing runs throughout)
-		local unlockCam = startCameraLock(root)
 
 		local facingConn
 		facingConn = trackActive(RunService.RenderStepped:Connect(function()
 			applyFacing(root, hum, target)
 		end))
+		local unlockCam = startCameraLock(root, target)
+
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
 			if traveled >= totalLen then
 				connection:Disconnect()
@@ -318,15 +317,14 @@ local function activate()
 				local lingerConn
 				lingerConn = trackActive(RunService.RenderStepped:Connect(function()
 					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= 1 then
+					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
-						-- Unlock camera and AutoRotate at the exact same moment
-						unlockCam()
 						if hum then hum.AutoRotate = true end
 						return
 					end
 					applyFacing(root, hum, target)
 				end))
+				local lingerCamUnlock = startCameraLock(root, target)
 				return
 			end
 			traveled = traveled + speed * dt
