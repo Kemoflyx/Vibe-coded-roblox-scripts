@@ -23,7 +23,7 @@ local W_SIDE_OFFSET    = 4.5    -- W dash lateral offset from target (studs)
 local W_FORWARD_OFFSET = 1      -- W dash forward offset past target (studs)
 local CAM_LOCK_DURATION = 0.55   -- how long camera stares at target (seconds)
 local CAM_RIGHT_OFFSET  = 1.5    -- aim point shifted to your right (studs)
-local CAM_AIM_HEIGHT    = 0.3    -- aim height: fraction of HipHeight above feet (0=feet, 1=hip, 2=head)
+local CAM_AIM_HEIGHT    = -2     -- studs above your root Y to aim at (negative = below root = looking down)
 
 local onCooldown  = false
 local onCooldownW = false
@@ -117,21 +117,19 @@ onCleanup(function()
 end)
 
 -- Velocity tracker: exponential moving average smooths out per-frame noise
--- so prediction and facing don't jitter when the target's replicated position twitches
-local VEL_SMOOTH = 0.15  -- lower = smoother but more lag, higher = more reactive
+local VEL_SMOOTH = 0.15
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	if dt <= 0 then return end
 	for _, data in pairs(targetCache) do
 		local curPos  = data.Root.Position
 		local rawVel  = (curPos - data.prevPos) / dt
 		data.velocity    = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
-		data.smoothedPos = data.smoothedPos:Lerp(curPos, 0.35)  -- smooths out network interpolation noise
+		data.smoothedPos = data.smoothedPos:Lerp(curPos, 0.35)
 		data.prevPos     = curPos
 	end
 end))
 onCleanup(function() velTracker:Disconnect() end)
 
--- Returns predicted position DIR_LOOKAHEAD seconds ahead, XZ only
 local function getPredictedPos(targetRoot)
 	for _, data in pairs(targetCache) do
 		if data.Root == targetRoot then
@@ -142,7 +140,6 @@ local function getPredictedPos(targetRoot)
 	return targetRoot.Position
 end
 
--- Returns the smoothed position of a target root, damping network interpolation noise
 local function getSmoothedPos(targetRoot)
 	for _, data in pairs(targetCache) do
 		if data.Root == targetRoot then
@@ -152,7 +149,6 @@ local function getSmoothedPos(targetRoot)
 	return targetRoot.Position
 end
 
--- Helpers
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
@@ -207,8 +203,6 @@ local function getTarget(root, range)
 	return closest
 end
 
--- Facing uses real position — prediction is only for the one-time tween destination,
--- not per-frame facing (per-frame prediction causes jitter as velocity fluctuates)
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
 	local myPos    = root.Position
@@ -220,59 +214,36 @@ local function applyFacing(root, hum, targetRoot)
 	end
 end
 
-
 -- Camera Lock
+-- CameraType stays Custom so Roblox moves the position naturally.
+-- PreRender reads live camera position and only forces look direction.
+-- Nothing from before the lock is ever remembered.
 local function startCameraLock(root, target)
-	local startTime   = tick()
-	local unlocked    = false
-	local conns       = {}
-	local localCamPos = root.CFrame:PointToObjectSpace(camera.CFrame.Position)
+	local startTime = tick()
+	local unlocked  = false
+	local conn
 
 	local function doUnlock()
 		if unlocked then return end
 		unlocked = true
-		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-		camera.CameraType = Enum.CameraType.Custom
+		conn:Disconnect()
 	end
 
-	-- Snapshot aimY once so camera ignores vertical movement of target
-	local snapTarget = getSmoothedPos(target)
-	local snapHum    = target.Parent and target.Parent:FindFirstChildOfClass("Humanoid")
-	local snapHipH   = snapHum and snapHum.HipHeight or 2.35
-	local fixedAimY  = (snapTarget.Y - snapHipH - (target.Size.Y / 2)) + snapHipH * CAM_AIM_HEIGHT
-
-	local function applyLock()
-		local camPos = root.CFrame:PointToWorldSpace(localCamPos)
+	conn = trackActive(RunService.PreRender:Connect(function()
+		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		local camPos = camera.CFrame.Position
 		local sp     = getSmoothedPos(target)
-		-- Use fixedAimY so camera doesn't bob up/down when target jumps or falls
-		local aimPos = Vector3.new(sp.X, fixedAimY, sp.Z)
+		local aimPos = Vector3.new(sp.X, root.Position.Y + CAM_AIM_HEIGHT, sp.Z)
 		           + root.CFrame.RightVector * CAM_RIGHT_OFFSET
 		camera.CFrame = CFrame.lookAt(camPos, aimPos)
-	end
-
-	camera.CameraType = Enum.CameraType.Scriptable
-
-	-- Write on EVERY stage of the frame so no matter when the game reads
-	-- camera.CFrame.LookVector (InputBegan, Stepped, Heartbeat, or PreRender),
-	-- it always sees the locked direction. Same coverage as applyFacing on root.CFrame.
-	table.insert(conns, trackActive(RunService.Stepped:Connect(function(_, dt)
-		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
-		applyLock()
-	end)))
-	table.insert(conns, trackActive(RunService.Heartbeat:Connect(function()
-		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
-		applyLock()
-	end)))
-	table.insert(conns, trackActive(RunService.PreRender:Connect(function()
-		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
-		applyLock()
-	end)))
+	end))
 
 	return doUnlock
-end-- Dash
-local function activate()
-	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
-	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
+end
+
+-- Dash
+-- holdingW/holdingS are read at InputBegan (exact moment E is pressed) and passed in
+local function activate(holdingW, holdingS)
 
 	if holdingS then
 		local char = getCharacter()
@@ -406,8 +377,17 @@ local function activate()
 	end)
 end
 
+-- Track all movement keys ourselves so state is never stale
+local keysHeld = {}
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
 	if gp then return end
-	if input.KeyCode == Enum.KeyCode.E then activate() end
+	keysHeld[input.KeyCode] = true
+	if input.KeyCode == Enum.KeyCode.E then
+		activate(keysHeld[Enum.KeyCode.W] == true, keysHeld[Enum.KeyCode.S] == true)
+	end
+end))
+local c6 = trackActive(UIS.InputEnded:Connect(function(input)
+	keysHeld[input.KeyCode] = false
 end))
 onCleanup(function() c5:Disconnect() end)
+onCleanup(function() c6:Disconnect() end)
