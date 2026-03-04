@@ -8,7 +8,7 @@ local camera     = workspace.CurrentCamera
 
 -- Tunable values
 local COOLDOWN         = 2      -- normal side dash cooldown (seconds)
-local COOLDOWN_W       = 7      -- W front dash cooldown (seconds)
+local COOLDOWN_W       = 5      -- W front dash cooldown (seconds)
 local MAX_RANGE        = 30     -- normal side dash max target range (studs)
 local MAX_RANGE_W      = 35     -- W front dash max target range (studs)
 local DASH_SPEED       = 115    -- normal side arch movement speed
@@ -391,3 +391,4 @@ local c6 = trackActive(UIS.InputEnded:Connect(function(input)
 end))
 onCleanup(function() c5:Disconnect() end)
 onCleanup(function() c6:Disconnect() end)
+
