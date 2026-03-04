@@ -22,8 +22,8 @@ local ARCH_OVERSHOOT   = 4      -- how far past target the arc endpoint extends 
 local W_SIDE_OFFSET    = 4.5    -- W dash lateral offset from target (studs)
 local W_FORWARD_OFFSET = 1      -- W dash forward offset past target (studs)
 local CAM_LOCK_DURATION = 0.55   -- how long camera stares at target (seconds)
-local CAM_RIGHT_OFFSET  = 3.5    -- aim point shifted to your right (studs)
-local CAM_DOWN_OFFSET   = 2.0    -- aim point shifted downward (studs)
+local CAM_RIGHT_OFFSET  = 2    -- aim point shifted to your right (studs)
+local CAM_DOWN_OFFSET   = 0    -- aim point shifted downward (studs)
 local CAM_AIM_HEIGHT    = -2     -- studs above your root Y to aim at (negative = below root = looking down)
 
 local onCooldown  = false
