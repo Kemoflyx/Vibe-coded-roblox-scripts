@@ -48,7 +48,7 @@ local function addModel(model)
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	if hrp and hum then
-		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero }
+		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
 		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
 		table.insert(diedConns, dc)
 	end
@@ -120,8 +120,9 @@ local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	for _, data in pairs(targetCache) do
 		local curPos  = data.Root.Position
 		local rawVel  = (curPos - data.prevPos) / dt
-		data.velocity = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
-		data.prevPos  = curPos
+		data.velocity    = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
+		data.smoothedPos = data.smoothedPos:Lerp(curPos, 0.35)  -- smooths out network interpolation noise
+		data.prevPos     = curPos
 	end
 end))
 onCleanup(function() velTracker:Disconnect() end)
@@ -132,6 +133,16 @@ local function getPredictedPos(targetRoot)
 		if data.Root == targetRoot then
 			local vel = data.velocity
 			return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
+		end
+	end
+	return targetRoot.Position
+end
+
+-- Returns the smoothed position of a target root, damping network interpolation noise
+local function getSmoothedPos(targetRoot)
+	for _, data in pairs(targetCache) do
+		if data.Root == targetRoot then
+			return data.smoothedPos
 		end
 	end
 	return targetRoot.Position
@@ -196,8 +207,9 @@ end
 -- not per-frame facing (per-frame prediction causes jitter as velocity fluctuates)
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
-	local myPos = root.Position
-	local dir   = Vector3.new(targetRoot.Position.X - myPos.X, 0, targetRoot.Position.Z - myPos.Z)
+	local myPos    = root.Position
+	local smoothed = getSmoothedPos(targetRoot)
+	local dir      = Vector3.new(smoothed.X - myPos.X, 0, smoothed.Z - myPos.Z)
 	if dir.Magnitude > 0.01 then
 		local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
 		root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
@@ -205,9 +217,7 @@ local function applyFacing(root, hum, targetRoot)
 end
 
 -- Dash
-local function activate()
-	local holdingW = UIS:IsKeyDown(Enum.KeyCode.W)
-	local holdingS = UIS:IsKeyDown(Enum.KeyCode.S)
+local function activate(holdingW, holdingS)
 
 	if holdingS then
 		local char = getCharacter()
@@ -220,7 +230,7 @@ local function activate()
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 		local startTime = tick()
 		local conn
-		conn = trackActive(RunService.RenderStepped:Connect(function()
+		conn = trackActive(RunService.PreRender:Connect(function()
 			if tick() - startTime >= FACING_LINGER then
 				conn:Disconnect()
 				if hum then hum.AutoRotate = true end
@@ -274,7 +284,7 @@ local function activate()
 				local lingerStart = tick()
 				local currentDir  = root.CFrame.LookVector
 				local lingerConn
-				lingerConn = trackActive(RunService.RenderStepped:Connect(function(ldt)
+				lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
@@ -303,7 +313,7 @@ local function activate()
 		local midpoint  = (startPos + finalPos) / 2 + perp * archWidth * sideDirection
 		local arcTable, totalLen = buildArcTable(startPos, midpoint, finalPos)
 		local facingConn
-		facingConn = trackActive(RunService.RenderStepped:Connect(function()
+		facingConn = trackActive(RunService.PreRender:Connect(function()
 			applyFacing(root, hum, target)
 		end))
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
@@ -312,7 +322,7 @@ local function activate()
 				facingConn:Disconnect()
 				local lingerStart = tick()
 				local lingerConn
-				lingerConn = trackActive(RunService.RenderStepped:Connect(function()
+				lingerConn = trackActive(RunService.PreRender:Connect(function()
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
@@ -335,8 +345,17 @@ local function activate()
 	end)
 end
 
+-- Track all movement keys ourselves so state is never stale
+local keysHeld = {}
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
 	if gp then return end
-	if input.KeyCode == Enum.KeyCode.E then activate() end
+	keysHeld[input.KeyCode] = true
+	if input.KeyCode == Enum.KeyCode.E then
+		activate(keysHeld[Enum.KeyCode.W] == true, keysHeld[Enum.KeyCode.S] == true)
+	end
+end))
+local c6 = trackActive(UIS.InputEnded:Connect(function(input)
+	keysHeld[input.KeyCode] = false
 end))
 onCleanup(function() c5:Disconnect() end)
+onCleanup(function() c6:Disconnect() end)
