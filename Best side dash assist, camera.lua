@@ -8,7 +8,7 @@ local camera     = workspace.CurrentCamera
 
 -- Tunable values
 local COOLDOWN         = 2      -- normal side dash cooldown (seconds)
-local COOLDOWN_W       = 5      -- W front dash cooldown (seconds)
+local COOLDOWN_W       = 7      -- W front dash cooldown (seconds)
 local MAX_RANGE        = 30     -- normal side dash max target range (studs)
 local MAX_RANGE_W      = 35     -- W front dash max target range (studs)
 local DASH_SPEED       = 115    -- normal side arch movement speed
@@ -22,7 +22,8 @@ local ARCH_OVERSHOOT   = 4      -- how far past target the arc endpoint extends 
 local W_SIDE_OFFSET    = 4.5    -- W dash lateral offset from target (studs)
 local W_FORWARD_OFFSET = 1      -- W dash forward offset past target (studs)
 local CAM_LOCK_DURATION = 0.55   -- how long camera stares at target (seconds)
-local CAM_RIGHT_OFFSET  = 1.5    -- aim point shifted to your right (studs)
+local CAM_RIGHT_OFFSET  = 3.5    -- aim point shifted to your right (studs)
+local CAM_DOWN_OFFSET   = 2.0    -- aim point shifted downward (studs)
 local CAM_AIM_HEIGHT    = -2     -- studs above your root Y to aim at (negative = below root = looking down)
 
 local onCooldown  = false
@@ -149,6 +150,16 @@ local function getSmoothedPos(targetRoot)
 	return targetRoot.Position
 end
 
+
+local function isRagdolled()
+	local char = player.Character
+	if not char then return true end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum then return true end
+	return hum:GetState() == Enum.HumanoidStateType.Physics
+end
+
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
@@ -214,36 +225,87 @@ local function applyFacing(root, hum, targetRoot)
 	end
 end
 
+
+local keysHeld = {}
+
+-- R Lock: toggle character facing lock onto target closest to cursor
+local rLockActive = false
+local rLockPaused = false
+local rLockTarget = nil
+local rLockConn   = nil
+local rHighlight  = nil
+
+local function stopRLock()
+	rLockActive = false
+	rLockTarget = nil
+	if rLockConn then rLockConn:Disconnect() rLockConn = nil end
+	if rHighlight then rHighlight:Destroy() rHighlight = nil end
+	local c = player.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	if h then h.AutoRotate = true end
+end
+
+local function startRLock(target)
+	rLockActive = true
+	rLockTarget = target
+	local hl = Instance.new("Highlight")
+	hl.FillColor         = Color3.fromRGB(255, 255, 255)
+	hl.OutlineColor      = Color3.fromRGB(255, 255, 255)
+	hl.FillTransparency  = 0.5
+	hl.Parent            = target.Parent
+	rHighlight = hl
+	rLockConn = trackActive(RunService.PreRender:Connect(function()
+		if rLockPaused then return end
+		if isRagdolled() then stopRLock() return end
+		local c = player.Character
+		if not c then return end
+		local r = c:FindFirstChild("HumanoidRootPart")
+		if not r then return end
+		if not rLockTarget or not rLockTarget.Parent then stopRLock() return end
+		local h = c:FindFirstChildOfClass("Humanoid")
+		if h then h.AutoRotate = false end
+		local myPos   = r.Position
+		local predPos = getPredictedPos(rLockTarget)
+		local dir     = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
+		if dir.Magnitude > 0.01 then
+			local lc = CFrame.lookAt(myPos, myPos + dir)
+			r.CFrame = CFrame.new(myPos) * (lc - lc.Position)
+		end
+	end))
+end
+
 -- Camera Lock
--- CameraType stays Custom so Roblox moves the position naturally.
--- PreRender reads live camera position and only forces look direction.
--- Nothing from before the lock is ever remembered.
 local function startCameraLock(root, target)
 	local startTime = tick()
 	local unlocked  = false
-	local conn
+	local stepName  = "__dashCamLock__"
 
 	local function doUnlock()
 		if unlocked then return end
 		unlocked = true
-		conn:Disconnect()
+		RunService:UnbindFromRenderStep(stepName)
 	end
 
-	conn = trackActive(RunService.PreRender:Connect(function()
+	RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
 		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
 		local camPos = camera.CFrame.Position
 		local sp     = getSmoothedPos(target)
 		local aimPos = Vector3.new(sp.X, root.Position.Y + CAM_AIM_HEIGHT, sp.Z)
-		           + root.CFrame.RightVector * CAM_RIGHT_OFFSET
-		camera.CFrame = CFrame.lookAt(camPos, aimPos)
-	end))
+		local cf     = CFrame.new(camPos, aimPos)
+		aimPos = aimPos + cf.RightVector * CAM_RIGHT_OFFSET - cf.UpVector * CAM_DOWN_OFFSET
+		camera.CFrame = CFrame.new(camPos, aimPos)
+	end)
 
 	return doUnlock
 end
 
+
 -- Dash
 -- holdingW/holdingS are read at InputBegan (exact moment E is pressed) and passed in
-local function activate(holdingW, holdingS)
+local function activate()
+	if isRagdolled() then return end
+	local holdingW = keysHeld[Enum.KeyCode.W] == true
+	local holdingS = keysHeld[Enum.KeyCode.S] == true
 
 	if holdingS then
 		local char = getCharacter()
@@ -252,11 +314,10 @@ local function activate(holdingW, holdingS)
 		local target = getTarget(root, math.huge)
 		if not target then return end
 		local hum = char:FindFirstChildOfClass("Humanoid")
-		press(Enum.KeyCode.Q)
-		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 		local startTime = tick()
 		local conn
 		conn = trackActive(RunService.PreRender:Connect(function()
+			if isRagdolled() then conn:Disconnect() if hum then hum.AutoRotate = true end return end
 			if tick() - startTime >= FACING_LINGER then
 				conn:Disconnect()
 				if hum then hum.AutoRotate = true end
@@ -285,10 +346,9 @@ local function activate(holdingW, holdingS)
 	local toTarget      = (targetPos - startPos).Unit
 	local distance      = (targetPos - startPos).Magnitude
 	local perp          = Vector3.new(-toTarget.Z, 0, toTarget.X)
-	local sideDirection = ((root.CFrame.RightVector):Dot(toTarget) >= 0) and 1 or -1
+	local sideDirection = ((camera.CFrame.RightVector):Dot(toTarget) >= 0) and 1 or -1
 	if holdingW then sideDirection = -sideDirection end
 	local sideKey = sideDirection == -1 and Enum.KeyCode.A or Enum.KeyCode.D
-
 	press(sideKey)
 	task.wait(0.015)
 	press(Enum.KeyCode.Q)
@@ -304,7 +364,9 @@ local function activate(holdingW, holdingS)
 		local totalLen = (finalPos - startPos).Magnitude
 		local moveDir  = (finalPos - startPos).Unit
 		if hum then hum.AutoRotate = false end
+		rLockPaused = true
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
+			if isRagdolled() then connection:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
 			traveled = traveled + speed * dt
 			if traveled >= totalLen then
 				connection:Disconnect()
@@ -312,10 +374,12 @@ local function activate(holdingW, holdingS)
 				local currentDir  = root.CFrame.LookVector
 				local lingerConn
 				lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
+					if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
 						if hum then hum.AutoRotate = true end
+						rLockPaused = false
 						return
 					end
 					local myPos = root.Position
@@ -342,10 +406,12 @@ local function activate(holdingW, holdingS)
 		local arcTable, totalLen = buildArcTable(startPos, midpoint, finalPos)
 		local facingConn
 		facingConn = trackActive(RunService.PreRender:Connect(function()
+			if isRagdolled() then facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
 			applyFacing(root, hum, target)
 		end))
 		local unlockCam = startCameraLock(root, target)
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
+			if isRagdolled() then connection:Disconnect() facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
 			if traveled >= totalLen then
 				connection:Disconnect()
 				facingConn:Disconnect()
@@ -355,6 +421,7 @@ local function activate(holdingW, holdingS)
 				local lingerStart = tick()
 				local lingerConn
 				lingerConn = trackActive(RunService.PreRender:Connect(function()
+					if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end return end
 					if hum then hum.AutoRotate = false end
 					if tick() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
@@ -377,18 +444,26 @@ local function activate(holdingW, holdingS)
 	end)
 end
 
--- Track all movement keys ourselves so state is never stale
-local keysHeld = {}
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
 	if gp then return end
-	keysHeld[input.KeyCode] = true
+	if input.KeyCode ~= Enum.KeyCode.Unknown then keysHeld[input.KeyCode] = true end
 	if input.KeyCode == Enum.KeyCode.E then
-		activate(keysHeld[Enum.KeyCode.W] == true, keysHeld[Enum.KeyCode.S] == true)
+		activate()
+	elseif input.KeyCode == Enum.KeyCode.C then
+		if rLockActive then
+			stopRLock()
+		else
+			local char = getCharacter()
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if root then
+				local target = getTarget(root, math.huge)
+				if target then startRLock(target) end
+			end
+		end
 	end
 end))
 local c6 = trackActive(UIS.InputEnded:Connect(function(input)
-	keysHeld[input.KeyCode] = false
+	if input.KeyCode ~= Enum.KeyCode.Unknown then keysHeld[input.KeyCode] = false end
 end))
 onCleanup(function() c5:Disconnect() end)
 onCleanup(function() c6:Disconnect() end)
-
