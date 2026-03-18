@@ -286,9 +286,44 @@ end))
 
 -- Dash
 local function activate()
-	if isRagdolled() then return end
-	local holdingW = keysHeld[Enum.KeyCode.W] == true
-	local holdingS = keysHeld[Enum.KeyCode.S] == true
+	local _holdW0 = keysHeld[Enum.KeyCode.W] == true
+	local _holdS0 = keysHeld[Enum.KeyCode.S] == true
+	local _char0  = player.Character
+	local _root0  = _char0 and _char0:FindFirstChild("HumanoidRootPart")
+	local _preSD  = nil
+	local _preSK  = Enum.KeyCode.D
+	if _root0 and not _holdS0 then
+		local _tgt0 = getTarget(_root0, _holdW0 and MAX_RANGE_W or MAX_RANGE)
+		if _tgt0 then
+			local _sp0 = getPredictedPos(_tgt0)
+			local _tp0 = Vector3.new(_sp0.X, _root0.Position.Y, _sp0.Z)
+			local _to0 = (_tp0 - _root0.Position)
+			if _to0.Magnitude > 0.01 then
+				_to0 = _to0.Unit
+				_preSD = (workspace.CurrentCamera.CFrame.RightVector:Dot(_to0) >= 0) and 1 or -1
+				if _holdW0 then _preSD = -_preSD end
+				_preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
+			end
+		end
+		press(_preSK)
+		task.delay(0.015, function() press(Enum.KeyCode.Q) end)
+		task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
+		task.delay(0.075, function() release(_preSK) end)
+	else
+		press(Enum.KeyCode.Q)
+		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
+	end
+	local _ragWatchStart = tick()
+	local _ragWatchFired = false
+	local _ragWatchConn
+	_ragWatchConn = RunService.Heartbeat:Connect(function()
+		if _ragWatchFired then _ragWatchConn:Disconnect() return end
+		if tick() - _ragWatchStart > 0.034 then _ragWatchFired = true _ragWatchConn:Disconnect() return end
+		if isRagdolled() then return end
+		_ragWatchFired = true
+		_ragWatchConn:Disconnect()
+		local holdingW = _holdW0
+		local holdingS = _holdS0
 
 	if holdingS then
 		local char = getCharacter()
@@ -332,11 +367,6 @@ local function activate()
 	if holdingW then sideDirection = -sideDirection end
 	local sideKey = sideDirection == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 
-	press(sideKey)
-	task.wait(0.015)
-	press(Enum.KeyCode.Q)
-	task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
-	task.delay(0.075, function() release(sideKey) end)
 
 	local speed    = holdingW and DASH_SPEED_W or DASH_SPEED
 	local traveled = 0
@@ -346,6 +376,8 @@ local function activate()
 		-- W dash: track target live each frame, always end to their right
 		if hum then hum.AutoRotate = false end
 		rLockPaused = true
+	local yVel = 0  -- track Y velocity for gravity during tween
+	local GRAVITY = -196.2  -- studs/s^2 (Roblox default workspace gravity)
 
 		-- Estimate initial total length for progress tracking
 		local initPerp2 = Vector3.new(-initTo.Z, 0, initTo.X)
@@ -368,6 +400,7 @@ local function activate()
 				initFinal = finalPos
 			end
 
+			yVel = yVel + GRAVITY * dt
 			traveled = traveled + speed * dt
 			if traveled >= totalLen then
 				connection:Disconnect()
@@ -398,9 +431,10 @@ local function activate()
 			local moveDir = (finalPos - startPos)
 			if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
 			local pos = startPos + moveDir * traveled
+			local newY = root.Position.Y + yVel * dt
 			root.CFrame = CFrame.new(
-				Vector3.new(pos.X, root.Position.Y, pos.Z),
-				Vector3.new(pos.X + moveDir.X, root.Position.Y, pos.Z + moveDir.Z)
+				Vector3.new(pos.X, newY, pos.Z),
+				Vector3.new(pos.X + moveDir.X, newY, pos.Z + moveDir.Z)
 			)
 		end))
 	else
@@ -413,6 +447,9 @@ local function activate()
 		local arcTable, totalLen = buildArcTable(startPos, initMid, initFinal)
 
 		local facingConn
+	local yVel = 0  -- track Y velocity for gravity during tween
+	local GRAVITY = -196.2  -- studs/s^2 (Roblox default workspace gravity)
+
 		facingConn = trackActive(RunService.PreRender:Connect(function()
 			if isRagdolled() then facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
 			applyFacing(root, hum, target)
@@ -453,6 +490,7 @@ local function activate()
 				end))
 				return
 			end
+			yVel = yVel + GRAVITY * dt
 			traveled = traveled + speed * dt
 			local t        = arcLenToT(arcTable, math.min(traveled, totalLen))
 			local livePos2 = getPredictedPos(target)
@@ -469,13 +507,15 @@ local function activate()
 				liveMid2 = initMid
 			end
 			local curvePos = quadBezier(startPos, liveMid2, liveFin2, t)
-			root.CFrame = CFrame.new(Vector3.new(curvePos.X, root.Position.Y, curvePos.Z)) * (root.CFrame - root.CFrame.Position)
+			local newY = root.Position.Y + yVel * dt
+			root.CFrame = CFrame.new(Vector3.new(curvePos.X, newY, curvePos.Z)) * (root.CFrame - root.CFrame.Position)
 		end))
 	end
 
 	task.delay(holdingW and COOLDOWN_W or COOLDOWN, function()
 		if holdingW then onCooldownW = false else onCooldown = false end
 	end)
+	end) -- end ragdoll watcher
 end
 
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
