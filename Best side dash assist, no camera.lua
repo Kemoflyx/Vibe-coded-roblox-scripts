@@ -306,7 +306,7 @@ local function activate()
 			end
 		end
 		press(_preSK)
-		task.delay(0.015, function() press(Enum.KeyCode.Q) end)
+		press(Enum.KeyCode.Q)
 		task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
 		task.delay(0.075, function() release(_preSK) end)
 	else
