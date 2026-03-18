@@ -317,6 +317,9 @@ local function activate()
 	-- Snapshot everything upfront so sideKey is computed ONCE and reused everywhere
 	local _holdW0 = keysHeld[Enum.KeyCode.W] == true
 	local _holdS0 = keysHeld[Enum.KeyCode.S] == true
+	-- Bail before Q if on cooldown
+	if _holdW0 and onCooldownW then return end
+	if not _holdW0 and not _holdS0 and onCooldown then return end
 	local _char0  = player.Character
 	local _root0  = _char0 and _char0:FindFirstChild("HumanoidRootPart")
 	local _preSD  = nil  -- pre-computed sideDirection upvalue shared with delay body
@@ -335,7 +338,7 @@ local function activate()
 			end
 		end
 		press(_preSK)
-		task.delay(0.015, function() press(Enum.KeyCode.Q) end)
+		press(Enum.KeyCode.Q)
 		task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
 		task.delay(0.075, function() release(_preSK) end)
 	else
