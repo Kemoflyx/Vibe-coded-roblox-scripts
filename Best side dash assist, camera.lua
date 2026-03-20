@@ -50,6 +50,20 @@ local function addModel(model)
 	if model == player.Character then return end
 	local hrp = model:FindFirstChild("HumanoidRootPart")
 	local hum = model:FindFirstChildOfClass("Humanoid")
+	-- Retry until HRP and Humanoid exist (up to 2 seconds)
+	if not hrp or not hum then
+		task.spawn(function()
+			local t = 0
+			while t < 2 do
+				task.wait(0.05)
+				t = t + 0.05
+				if not model.Parent then return end
+				hrp = model:FindFirstChild("HumanoidRootPart")
+				hum = model:FindFirstChildOfClass("Humanoid")
+				if hrp and hum then break end
+			end
+		end)
+	end
 	if hrp and hum then
 		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
 		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
@@ -92,7 +106,7 @@ local c2 = Players.PlayerRemoving:Connect(function(p)
 end)
 local c3 = workspace.DescendantAdded:Connect(function(d)
 	if d:IsA("Humanoid") then
-		task.wait(0.1)
+		task.wait(0.05)
 		local model = d.Parent
 		if model and model:IsA("Model") and model:FindFirstChild("HumanoidRootPart") then
 			addModel(model)
@@ -114,6 +128,20 @@ onCleanup(function()
 	for _, c in ipairs(diedConns) do pcall(function() c:Disconnect() end) end
 	diedConns = {}
 end)
+
+
+-- Periodic rescan: catches anyone missed due to timing (every 3 seconds)
+trackActive(RunService.Heartbeat:Connect(function()
+	local now = tick()
+	if not _G.__lastRescan or now - _G.__lastRescan < 3 then return end
+	_G.__lastRescan = now
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and p.Character and not targetCache[p.Character] then
+			addModel(p.Character)
+		end
+	end
+end))
+_G.__lastRescan = tick()
 
 local VEL_SMOOTH = 0.15
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
@@ -250,7 +278,8 @@ local function startRLock(target)
 	hl.FillTransparency  = 0.5
 	hl.Parent            = target.Parent
 	rHighlight = hl
-	rLockConn = trackActive(RunService.PreRender:Connect(function()
+	local smoothDir = nil  -- smoothed facing direction, velocity-weighted lerp
+	rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
 		if rLockPaused then return end
 		if isRagdolled() then stopRLock() return end
 		local c = player.Character
@@ -262,10 +291,20 @@ local function startRLock(target)
 		if h then h.AutoRotate = false end
 		local myPos   = r.Position
 		local predPos = getPredictedPos(rLockTarget)
-		local dir     = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
-		if dir.Magnitude > 0.01 then
-			local lc = CFrame.lookAt(myPos, myPos + dir)
-			r.CFrame = CFrame.new(myPos) * (lc - lc.Position)
+		local rawDir  = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
+		if rawDir.Magnitude > 0.01 then
+			rawDir = rawDir.Unit
+			-- Velocity-based lerp speed: faster lerp when target moves fast, min 8 max 20
+			local tData = nil
+			for _, d in pairs(targetCache) do if d.Root == rLockTarget then tData = d break end end
+			local spd = tData and tData.velocity.Magnitude or 0
+			local lerpSpeed = math.clamp(8 + spd * 0.5, 8, 20)
+			if not smoothDir then smoothDir = rawDir end
+			smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
+			if smoothDir.Magnitude > 0.01 then
+				local lc = CFrame.lookAt(myPos, myPos + smoothDir)
+				r.CFrame = CFrame.new(myPos) * (lc - lc.Position)
+			end
 		end
 	end))
 end
@@ -324,31 +363,40 @@ local function activate()
 	local _root0  = _char0 and _char0:FindFirstChild("HumanoidRootPart")
 	local _preSD  = nil  -- pre-computed sideDirection upvalue shared with delay body
 	local _preSK  = Enum.KeyCode.D  -- default
+	local _noKeys = not _holdW0 and not _holdS0 and not keysHeld[Enum.KeyCode.A] and not keysHeld[Enum.KeyCode.D]
+	-- Range check before pressing ANYTHING
 	if _root0 and not _holdS0 then
-		local _tgt0 = getTarget(_root0, _holdW0 and MAX_RANGE_W or MAX_RANGE)
-		if _tgt0 then
-			local _sp0 = getPredictedPos(_tgt0)
-			local _tp0 = Vector3.new(_sp0.X, _root0.Position.Y, _sp0.Z)
+		local _range = _holdW0 and MAX_RANGE_W or MAX_RANGE
+		local _tgt0  = getTarget(_root0, _range)
+		if not _tgt0 then return end  -- out of range, no Q, no nothing
+		if _noKeys then
+			local _tp0 = Vector3.new(_tgt0.Position.X, _root0.Position.Y, _tgt0.Position.Z)
 			local _to0 = (_tp0 - _root0.Position)
 			if _to0.Magnitude > 0.01 then
 				_to0 = _to0.Unit
-				_preSD = ((camera).CFrame.RightVector:Dot(_to0) >= 0) and 1 or -1
-				if _holdW0 then _preSD = -_preSD end
+				_preSD = (camera).CFrame.RightVector:Dot(_to0) >= 0 and 1 or -1
 				_preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 			end
+			press(_preSK)
+			press(Enum.KeyCode.Q)
+			task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
+			task.delay(0.075, function() release(_preSK) end)
+		else
+			-- W/A/D held: just Q
+			press(Enum.KeyCode.Q)
+			task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 		end
-		press(_preSK)
-		press(Enum.KeyCode.Q)
-		task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
-		task.delay(0.075, function() release(_preSK) end)
 	else
+		-- S dash: check range, then Q
+		local _tgt0 = _root0 and getTarget(_root0, math.huge) or nil
+		if not _tgt0 then return end
 		press(Enum.KeyCode.Q)
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 	end
 	local _ragWatchStart = tick()
 	local _ragWatchFired = false
 	local _ragWatchConn
-	_ragWatchConn = RunService.Heartbeat:Connect(function()
+	_ragWatchConn = trackActive(RunService.Heartbeat:Connect(function()
 		if _ragWatchFired then _ragWatchConn:Disconnect() return end
 		if tick() - _ragWatchStart > 0.034 then _ragWatchFired = true _ragWatchConn:Disconnect() return end
 		if isRagdolled() then return end
@@ -392,15 +440,13 @@ local function activate()
 	local startPos = root.Position
 
 	-- Use pre-computed side from upvalue — same as what was already pressed
-	local initPred   = getPredictedPos(target)
-	local initTarget = Vector3.new(initPred.X, startPos.Y, initPred.Z)
+	local initTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
 	local initTo     = (initTarget - startPos)
 	if initTo.Magnitude < 0.01 then return end
 	initTo = initTo.Unit
 	local sideDirection = _preSD or (((camera).CFrame.RightVector):Dot(initTo) >= 0) and 1 or -1
 	if not _preSD and holdingW then sideDirection = -sideDirection end
 	local sideKey = sideDirection == -1 and Enum.KeyCode.A or Enum.KeyCode.D
-
 
 	local speed    = holdingW and DASH_SPEED_W or DASH_SPEED
 	local traveled = 0
@@ -410,8 +456,6 @@ local function activate()
 		-- W dash: track target live each frame, always end to their right
 		if hum then hum.AutoRotate = false end
 		rLockPaused = true
-	local yVel = 0  -- track Y velocity for gravity during tween
-	local GRAVITY = -196.2  -- studs/s^2 (Roblox default workspace gravity)
 
 		-- Estimate initial total length for progress tracking
 		local initPerp2 = Vector3.new(-initTo.Z, 0, initTo.X)
@@ -422,8 +466,7 @@ local function activate()
 			if isRagdolled() then connection:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
 
 			-- Recompute destination only when target moves meaningfully (saves fps)
-			local livePos    = getPredictedPos(target)
-			local liveTarget = Vector3.new(livePos.X, startPos.Y, livePos.Z)
+			local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
 			local liveToTgt  = (liveTarget - startPos)
 			if liveToTgt.Magnitude < 0.01 then return end
 			local liveTo   = liveToTgt.Unit
@@ -434,7 +477,6 @@ local function activate()
 				initFinal = finalPos
 			end
 
-			yVel = yVel + GRAVITY * dt
 			traveled = traveled + speed * dt
 			if traveled >= totalLen then
 				connection:Disconnect()
@@ -466,10 +508,9 @@ local function activate()
 			local moveDir = (finalPos - startPos)
 			if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
 			local pos = startPos + moveDir * traveled
-			local newY = root.Position.Y + yVel * dt
 			root.CFrame = CFrame.new(
-				Vector3.new(pos.X, newY, pos.Z),
-				Vector3.new(pos.X + moveDir.X, newY, pos.Z + moveDir.Z)
+				Vector3.new(pos.X, root.Position.Y, pos.Z),
+				Vector3.new(pos.X + moveDir.X, root.Position.Y, pos.Z + moveDir.Z)
 			)
 		end))
 	else
@@ -494,8 +535,7 @@ local function activate()
 			if isRagdolled() then connection:Disconnect() facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
 
 			-- Rebuild arc only when target moves meaningfully (saves fps)
-			local livePos    = getPredictedPos(target)
-			local liveTarget = Vector3.new(livePos.X, startPos.Y, livePos.Z)
+			local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
 			local liveToTgt  = (liveTarget - startPos)
 			if liveToTgt.Magnitude > 0.01 then
 				local liveTo    = liveToTgt.Unit
@@ -530,8 +570,7 @@ local function activate()
 			yVel = yVel + GRAVITY * dt
 			traveled = traveled + speed * dt
 			local t        = arcLenToT(arcTable, math.min(traveled, totalLen))
-			local livePos2 = getPredictedPos(target)
-			local liveTgt2 = Vector3.new(livePos2.X, startPos.Y, livePos2.Z)
+			local liveTgt2 = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
 			local liveTo2  = (liveTgt2 - startPos)
 			local liveFin2, liveMid2
 			if liveTo2.Magnitude > 0.01 then
@@ -552,7 +591,7 @@ local function activate()
 	task.delay(holdingW and COOLDOWN_W or COOLDOWN, function()
 		if holdingW then onCooldownW = false else onCooldown = false end
 	end)
-	end) -- end ragdoll watcher
+	end)) -- end ragdoll watcher
 end
 
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
