@@ -30,7 +30,7 @@ local QD_RANGE        = 10     -- middle mouse dash max target range (studs)
 local QD_FACE_LINGER  = 0.5    -- middle mouse facing linger duration (seconds)
 local RAG_WATCH_WINDOW = 0.075  -- ragdoll check window after Q fires (seconds)
 local RAG_WATCH_Q_DELAY = 0.005 -- extra wait after Q before starting ragdoll check
-local RLOCK_LERP_MIN  = 25     -- C lock min facing lerp speed (standing still)
+local RLOCK_LERP_MIN  = 50     -- C lock min facing lerp speed (standing still)
 local RLOCK_LERP_MAX  = 50     -- C lock max facing lerp speed (running)
 local RLOCK_LERP_VEL  = 0.5    -- velocity multiplier for C lock lerp speed
 local ARC_REBUILD_THRESHOLD = 0.5 -- studs target must move before arc rebuilds
@@ -270,6 +270,14 @@ local rLockTarget = nil
 local rLockConn   = nil
 local rHighlight  = nil
 local lastRLockTarget = nil  -- remembers target for auto-relock
+
+-- Register stopRLock to run on re-execution
+onCleanup(function()
+	if rHighlight then rHighlight:Destroy() rHighlight = nil end
+	local c = player.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	if h then h.AutoRotate = true end
+end)
 
 local function stopRLock()
 	rLockActive = false
