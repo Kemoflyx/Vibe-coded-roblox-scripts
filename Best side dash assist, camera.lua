@@ -378,9 +378,9 @@ local function activate()
 				_preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 			end
 			press(_preSK)
-			press(Enum.KeyCode.Q)
-			task.delay(0.06,  function() release(Enum.KeyCode.Q) end)
-			task.delay(0.075, function() release(_preSK) end)
+			task.delay(0.010, function() press(Enum.KeyCode.Q) end)
+			task.delay(0.012, function() release(Enum.KeyCode.Q) end)
+			task.delay(0.015, function() release(_preSK) end)
 		else
 			-- W/A/D held: just Q
 			press(Enum.KeyCode.Q)
