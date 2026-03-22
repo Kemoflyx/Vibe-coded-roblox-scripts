@@ -22,9 +22,6 @@ local ARCH_OVERSHOOT   = 4
 local W_SIDE_OFFSET    = 4.5
 local W_FORWARD_OFFSET = 1
 local CAM_LOCK_DURATION = 0.55
-local CAM_RIGHT_OFFSET  = 2
-local CAM_DOWN_OFFSET   = 0
-local CAM_AIM_HEIGHT    = -2
 
 local QD_RANGE        = 10     -- middle mouse dash max target range (studs)
 local QD_FACE_LINGER  = 0.5    -- middle mouse facing linger duration (seconds)
@@ -34,6 +31,10 @@ local RLOCK_LERP_MIN  = 50     -- C lock min facing lerp speed (standing still)
 local RLOCK_LERP_MAX  = 50     -- C lock max facing lerp speed (running)
 local RLOCK_LERP_VEL  = 0.5    -- velocity multiplier for C lock lerp speed
 local ARC_REBUILD_THRESHOLD = 0.5 -- studs target must move before arc rebuilds
+local VEL_SMOOTH_FACTOR = 0.15   -- velocity smoothing factor for target tracking (lower = smoother)
+local POS_SMOOTH_FACTOR = 0.35   -- position smoothing factor for target tracking (lower = smoother)
+local W_FACE_LERP       = 0.0001 -- W dash linger facing lerp (lower = slower turn, 0.0001 = very smooth)
+local RLOCK_PRED_TIME   = 0.10   -- C lock prediction lookahead time (seconds)
 local QD_SIDE_TO_Q     = 0.02   -- seconds between sideKey press and Q (middle mouse dash)
 local QD_Q_TO_3       = 0.00   -- seconds between Q and first 3 press
 local QD_SK_RELEASE   = 0.05   -- seconds until sideKey releases
@@ -56,6 +57,7 @@ getgenv().__dashCleanup = function()
 end
 
 local targetCache = {}
+local rootToData  = {}  -- reverse map: HRP -> data, O(1) lookup
 local playerConns = {}
 local diedConns   = {}
 
@@ -78,13 +80,19 @@ local function addModel(model)
 		end)
 	end
 	if hrp and hum then
-		targetCache[model] = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
-		local dc = hum.Died:Connect(function() targetCache[model] = nil end)
+		local data = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
+		targetCache[model] = data
+		rootToData[hrp] = data
+		local dc = hum.Died:Connect(function() targetCache[model] = nil rootToData[hrp] = nil end)
 		table.insert(diedConns, dc)
 	end
 end
 
-local function removeModel(model) targetCache[model] = nil end
+local function removeModel(model)
+	local d = targetCache[model]
+	if d then rootToData[d.Root] = nil end
+	targetCache[model] = nil
+end
 
 local function trackPlayer(p)
 	if p == player then return end
@@ -148,44 +156,39 @@ trackActive(RunService.Heartbeat:Connect(function()
 	local now = tick()
 	if not getgenv().__lastRescan or now - getgenv().__lastRescan < 3 then return end
 	getgenv().__lastRescan = now
-	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= player and p.Character and not targetCache[p.Character] then
+	for p in pairs(playerConns) do
+		if p.Character and not targetCache[p.Character] then
 			addModel(p.Character)
 		end
 	end
 end))
 getgenv().__lastRescan = tick()
 
-local VEL_SMOOTH = 0.15
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	if dt <= 0 then return end
 	for _, data in pairs(targetCache) do
+		if not data.Root.Parent then continue end
 		local curPos  = data.Root.Position
 		local rawVel  = (curPos - data.prevPos) / dt
-		data.velocity    = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH)
-		data.smoothedPos = data.smoothedPos:Lerp(curPos, 0.35)
+		data.velocity    = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH_FACTOR)
+		data.smoothedPos = data.smoothedPos:Lerp(curPos, POS_SMOOTH_FACTOR)
 		data.prevPos     = curPos
 	end
 end))
 onCleanup(function() velTracker:Disconnect() end)
 
 local function getPredictedPos(targetRoot)
-	for _, data in pairs(targetCache) do
-		if data.Root == targetRoot then
-			local vel = data.velocity
-			return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
-		end
+	local data = rootToData[targetRoot]
+	if data then
+		local vel = data.velocity
+		return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
 	end
 	return targetRoot.Position
 end
 
 local function getSmoothedPos(targetRoot)
-	for _, data in pairs(targetCache) do
-		if data.Root == targetRoot then
-			return data.smoothedPos
-		end
-	end
-	return targetRoot.Position
+	local data = rootToData[targetRoot]
+	return data and data.smoothedPos or targetRoot.Position
 end
 
 local function isRagdolled()
@@ -311,14 +314,14 @@ local function startRLock(target)
 		local h = c:FindFirstChildOfClass("Humanoid")
 		if h then h.AutoRotate = false end
 		local myPos   = r.Position
-		local predPos = getPredictedPos(rLockTarget)
+		local _rld = rootToData[rLockTarget]
+		local predPos = rLockTarget.Position + (_rld and Vector3.new(_rld.velocity.X, 0, _rld.velocity.Z) * RLOCK_PRED_TIME or Vector3.zero)
 		local rawDir  = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
 		if rawDir.Magnitude > 0.01 then
 			rawDir = rawDir.Unit
 			-- Velocity-based lerp speed: faster lerp when target moves fast, min 8 max 20
-			local tData = nil
-			for _, d in pairs(targetCache) do if d.Root == rLockTarget then tData = d break end end
-			local spd = tData and tData.velocity.Magnitude or 0
+			local _tData = rootToData[rLockTarget]
+			local spd = _tData and _tData.velocity.Magnitude or 0
 			local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
 			if not smoothDir then smoothDir = rawDir end
 			smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
@@ -371,9 +374,8 @@ local function activate()
 				_preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 			end
 			press(_preSK)
-			task.delay(0.010, function() press(Enum.KeyCode.Q) end)
-			task.delay(0.012, function() release(Enum.KeyCode.Q) end)
-			task.delay(0.015, function() release(_preSK) end)
+			task.delay(QD_SIDE_TO_Q,               function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
+			task.delay(QD_SK_RELEASE,              function() release(_preSK) end)
 		else
 			press(Enum.KeyCode.Q)
 			task.delay(0.06, function() release(Enum.KeyCode.Q) end)
@@ -487,7 +489,7 @@ local function activate()
 					local myPos = root.Position
 					local dir2  = Vector3.new(target.Position.X - myPos.X, 0, target.Position.Z - myPos.Z)
 					if dir2.Magnitude > 0.01 then
-						currentDir = currentDir:Lerp(dir2.Unit, 1 - (0.0001 ^ ldt))
+						currentDir = currentDir:Lerp(dir2.Unit, 1 - (W_FACE_LERP ^ ldt))
 						local lookCFrame = CFrame.lookAt(myPos, myPos + currentDir)
 						root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
 					end
@@ -607,8 +609,6 @@ local function startCameraLock(root, target)
 		local hDist  = Vector3.new(target.Position.X - camPos.X, 0, target.Position.Z - camPos.Z).Magnitude
 		local aimY   = camPos.Y + tanPitch * hDist
 		local aimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
-		local cf     = CFrame.new(camPos, aimPos)
-		aimPos = aimPos + cf.RightVector * CAM_RIGHT_OFFSET
 		camera.CFrame = CFrame.new(camPos, aimPos)
 	end)
 
