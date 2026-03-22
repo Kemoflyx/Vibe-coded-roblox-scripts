@@ -4,10 +4,11 @@ local UIS        = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local VIM        = game:GetService("VirtualInputManager")
 local player     = Players.LocalPlayer
+local camera     = workspace.CurrentCamera
 
 -- Tunable values
 local COOLDOWN         = 2
-local COOLDOWN_W       = 7
+local COOLDOWN_W       = 6
 local MAX_RANGE        = 30
 local MAX_RANGE_W      = 35
 local DASH_SPEED       = 115
@@ -20,21 +21,38 @@ local ARCH_WIDTH_MAX   = 14
 local ARCH_OVERSHOOT   = 4
 local W_SIDE_OFFSET    = 4.5
 local W_FORWARD_OFFSET = 1
+local CAM_LOCK_DURATION = 0.55
+local CAM_RIGHT_OFFSET  = 2
+local CAM_DOWN_OFFSET   = 0
+local CAM_AIM_HEIGHT    = -2
+
+local QD_RANGE        = 10     -- middle mouse dash max target range (studs)
+local QD_FACE_LINGER  = 0.5    -- middle mouse facing linger duration (seconds)
+local RAG_WATCH_WINDOW = 0.075  -- ragdoll check window after Q fires (seconds)
+local RAG_WATCH_Q_DELAY = 0.005 -- extra wait after Q before starting ragdoll check
+local RLOCK_LERP_MIN  = 25     -- C lock min facing lerp speed (standing still)
+local RLOCK_LERP_MAX  = 50     -- C lock max facing lerp speed (running)
+local RLOCK_LERP_VEL  = 0.5    -- velocity multiplier for C lock lerp speed
+local ARC_REBUILD_THRESHOLD = 0.5 -- studs target must move before arc rebuilds
+local QD_SIDE_TO_Q     = 0.02   -- seconds between sideKey press and Q (middle mouse dash)
+local QD_Q_TO_3       = 0.00   -- seconds between Q and first 3 press
+local QD_SK_RELEASE   = 0.05   -- seconds until sideKey releases
+local QD_SECOND_3     = 0.30   -- seconds until second 3 press (from sideKey press)
 
 local onCooldown  = false
 local onCooldownW = false
 
-if _G.__dashCleanup then _G.__dashCleanup() end
+if getgenv().__dashCleanup then getgenv().__dashCleanup() end
 local cleanupTasks = {}
 local activeConns  = {}
 local function onCleanup(fn) table.insert(cleanupTasks, fn) end
 local function trackActive(c) table.insert(activeConns, c) return c end
-_G.__dashCleanup = function()
+getgenv().__dashCleanup = function()
 	for _, fn in ipairs(cleanupTasks) do pcall(fn) end
 	cleanupTasks = {}
 	for _, c in ipairs(activeConns) do pcall(function() c:Disconnect() end) end
 	activeConns = {}
-	_G.__dashCleanup = nil
+	getgenv().__dashCleanup = nil
 end
 
 local targetCache = {}
@@ -128,15 +146,15 @@ end)
 -- Periodic rescan: catches anyone missed due to timing (every 3 seconds)
 trackActive(RunService.Heartbeat:Connect(function()
 	local now = tick()
-	if not _G.__lastRescan or now - _G.__lastRescan < 3 then return end
-	_G.__lastRescan = now
+	if not getgenv().__lastRescan or now - getgenv().__lastRescan < 3 then return end
+	getgenv().__lastRescan = now
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= player and p.Character and not targetCache[p.Character] then
 			addModel(p.Character)
 		end
 	end
 end))
-_G.__lastRescan = tick()
+getgenv().__lastRescan = tick()
 
 local VEL_SMOOTH = 0.15
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
@@ -293,7 +311,7 @@ local function startRLock(target)
 			local tData = nil
 			for _, d in pairs(targetCache) do if d.Root == rLockTarget then tData = d break end end
 			local spd = tData and tData.velocity.Magnitude or 0
-			local lerpSpeed = math.clamp(8 + spd * 0.5, 8, 20)
+			local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
 			if not smoothDir then smoothDir = rawDir end
 			smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
 			if smoothDir.Magnitude > 0.01 then
@@ -358,12 +376,15 @@ local function activate()
 		press(Enum.KeyCode.Q)
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 	end
-	local _ragWatchStart = tick()
+	local _ragWatchStart = nil
 	local _ragWatchFired = false
 	local _ragWatchConn
+	-- Start timing from when Q fires so ragdoll cancel has time to register
+	task.delay(QD_SIDE_TO_Q + RAG_WATCH_Q_DELAY, function() _ragWatchStart = tick() end)
 	_ragWatchConn = trackActive(RunService.Heartbeat:Connect(function()
+		if not _ragWatchStart then return end
 		if _ragWatchFired then _ragWatchConn:Disconnect() return end
-		if tick() - _ragWatchStart > 0.034 then _ragWatchFired = true _ragWatchConn:Disconnect() return end
+		if tick() - _ragWatchStart > RAG_WATCH_WINDOW then _ragWatchFired = true _ragWatchConn:Disconnect() return end
 		if isRagdolled() then return end
 		_ragWatchFired = true
 		_ragWatchConn:Disconnect()
@@ -435,7 +456,7 @@ local function activate()
 			local liveTo   = liveToTgt.Unit
 			local livePerp = Vector3.new(-liveTo.Z, 0, liveTo.X)
 			local finalPos = liveTarget + livePerp * sideDirection * W_SIDE_OFFSET + liveTo * W_FORWARD_OFFSET
-			if (finalPos - initFinal).Magnitude > 0.5 then
+			if (finalPos - initFinal).Magnitude > ARC_REBUILD_THRESHOLD then
 				totalLen  = (finalPos - startPos).Magnitude
 				initFinal = finalPos
 			end
@@ -504,7 +525,7 @@ local function activate()
 				local livePerp  = Vector3.new(-liveTo.Z, 0, liveTo.X)
 				local liveFinal = liveTarget + liveTo * ARCH_OVERSHOOT
 				local liveMid   = (startPos + liveFinal) / 2 + livePerp * archWidth * sideDirection
-				if (liveFinal - initFinal).Magnitude > 0.5 then
+				if (liveFinal - initFinal).Magnitude > ARC_REBUILD_THRESHOLD then
 					arcTable, totalLen = buildArcTable(startPos, liveMid, liveFinal)
 					initFinal = liveFinal
 				end
@@ -554,11 +575,87 @@ local function activate()
 	end)) -- end ragdoll watcher
 end
 
+
+-- Camera Lock (middle mouse only)
+local function startCameraLock(root, target)
+	local startTime = tick()
+	local unlocked  = false
+	local stepName  = "__dashCamLock__"
+
+	local lv = camera.CFrame.LookVector
+	local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+	local rawPitch = hMag > 0.001 and (lv.Y / hMag) or 0
+	local tanPitch = math.clamp(rawPitch, -2, 0.5)
+
+	local function doUnlock()
+		if unlocked then return end
+		unlocked = true
+		RunService:UnbindFromRenderStep(stepName)
+	end
+
+	RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
+		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		local camPos = camera.CFrame.Position
+		local hDist  = Vector3.new(target.Position.X - camPos.X, 0, target.Position.Z - camPos.Z).Magnitude
+		local aimY   = camPos.Y + tanPitch * hDist
+		local aimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
+		local cf     = CFrame.new(camPos, aimPos)
+		aimPos = aimPos + cf.RightVector * CAM_RIGHT_OFFSET
+		camera.CFrame = CFrame.new(camPos, aimPos)
+	end)
+
+	return doUnlock
+end
+
+-- Quick dash (MouseButton3): sideKey+Q + facing, no tween, 0.5s linger, no stack
+local function quickDash()
+	if isRagdolled() then return end
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local target = getTarget(root, QD_RANGE)
+	if not target then return end  -- out of range: no keys pressed at all
+
+	-- Compute side from camera
+	local tp = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+	local to = (tp - root.Position)
+	if to.Magnitude < 0.01 then return end
+	to = to.Unit
+	local sd = (workspace.CurrentCamera).CFrame.RightVector:Dot(to) >= 0 and 1 or -1
+	local sk = sd == -1 and Enum.KeyCode.A or Enum.KeyCode.D
+
+	press(sk)
+	task.delay(QD_SIDE_TO_Q,                   function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
+	task.delay(QD_SIDE_TO_Q + QD_Q_TO_3,        function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
+	task.delay(QD_SK_RELEASE,                    function() release(sk) end)
+	task.delay(QD_SECOND_3,                      function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
+
+	startCameraLock(root, target)
+	local startTime = tick()
+	local conn
+	conn = trackActive(RunService.PreRender:Connect(function()
+		if isRagdolled() then
+			conn:Disconnect()
+			if hum then hum.AutoRotate = true end
+			return
+		end
+		if tick() - startTime >= QD_FACE_LINGER then
+			conn:Disconnect()
+			if hum then hum.AutoRotate = true end
+			return
+		end
+		applyFacing(root, hum, target)
+	end))
+end
+
 local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
 	if gp then return end
 	if input.KeyCode ~= Enum.KeyCode.Unknown then keysHeld[input.KeyCode] = true end
 	if input.KeyCode == Enum.KeyCode.E then
 		activate()
+	elseif input.UserInputType == Enum.UserInputType.MouseButton3 then
+		quickDash()
 	elseif input.KeyCode == Enum.KeyCode.C then
 		if rLockActive then
 			lastRLockTarget = nil  -- manual unlock clears memory
