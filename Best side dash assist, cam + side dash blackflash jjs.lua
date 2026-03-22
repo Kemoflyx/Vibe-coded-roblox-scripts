@@ -271,6 +271,14 @@ local rLockConn   = nil
 local rHighlight  = nil
 local lastRLockTarget = nil  -- remembers target for auto-relock
 
+-- Register stopRLock to run on re-execution
+onCleanup(function()
+	if rHighlight then rHighlight:Destroy() rHighlight = nil end
+	local c = player.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	if h then h.AutoRotate = true end
+end)
+
 local function stopRLock()
 	rLockActive = false
 	rLockTarget = nil
