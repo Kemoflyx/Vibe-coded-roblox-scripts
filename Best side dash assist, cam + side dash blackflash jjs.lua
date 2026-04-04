@@ -21,25 +21,52 @@ local ARCH_WIDTH_MAX   = 14
 local ARCH_OVERSHOOT   = 4
 local W_SIDE_OFFSET    = 4.5
 local W_FORWARD_OFFSET = 1
-local CAM_LOCK_DURATION = 0.55
-local CAM_OFFSET_RIGHT  = 2.25 -- Added: Offset camera facing to the right of the target (Shiftlock feel)
 
-local QD_RANGE        = 10     -- middle mouse dash max target range (studs)
-local QD_FACE_LINGER  = 0.5    -- middle mouse facing linger duration (seconds)
-local RAG_WATCH_WINDOW = 0.075  -- ragdoll check window after Q fires (seconds)
-local RAG_WATCH_Q_DELAY = 0.005 -- extra wait after Q before starting ragdoll check
-local RLOCK_LERP_MIN  = 50     -- C lock min facing lerp speed (standing still)
-local RLOCK_LERP_MAX  = 50     -- C lock max facing lerp speed (running)
-local RLOCK_LERP_VEL  = 0.5    -- velocity multiplier for C lock lerp speed
-local ARC_REBUILD_THRESHOLD = 0.5 -- studs target must move before arc rebuilds
-local VEL_SMOOTH_FACTOR = 0.15   -- velocity smoothing factor for target tracking (lower = smoother)
-local POS_SMOOTH_FACTOR = 0.35   -- position smoothing factor for target tracking (lower = smoother)
-local W_FACE_LERP       = 0.0001 -- W dash linger facing lerp (lower = slower turn, 0.0001 = very smooth)
-local RLOCK_PRED_TIME   = 0.10   -- C lock prediction lookahead time (seconds)
-local QD_SIDE_TO_Q     = 0.02   -- seconds between sideKey press and Q (middle mouse dash)
-local QD_Q_TO_3       = 0.00   -- seconds between Q and first 3 press
-local QD_SK_RELEASE   = 0.05   -- seconds until sideKey releases
-local QD_SECOND_3     = 0.30   -- seconds until second 3 press (from sideKey press)
+-- Camera lock timing (seconds)
+local CAM_LOCK_DURATION = 0.55
+
+-- ---------------------------
+-- Camera POSITION tunables
+-- ---------------------------
+-- These change the camera's anchored position during the lock (NOT the aim).
+-- All values are in studs except screen offsets which are pixels.
+local CAM_POS_UP_OFFSET       = 0    -- additional vertical offset added to camera anchor (studs)
+local CAM_POS_RIGHT_OFFSET    = 2   -- world-space right offset relative to target direction (studs)
+local CAM_POS_LEFT_OFFSET     = 0      -- alternative left offset (studs); net right = right - left
+local CAM_POS_FORWARD_OFFSET  = 0      -- push camera anchor toward the target (studs)
+local CAM_POS_BACK_OFFSET     = 0      -- push camera anchor away from the target (studs); net forward = forward - back
+
+-- Optional small screen-space nudge applied to aiming selection only (keeps target selection behavior tunable)
+local CAM_AIM_SCREEN_RIGHT    = 0      -- screen pixels; positive nudges aim selection right
+local CAM_AIM_SCREEN_UP       = 0      -- screen pixels; positive nudges aim selection down (screen Y increases downward)
+
+-- Vertical focus calculation tunables (used to compute base camera anchor height)
+local CAM_FOCUS_MULTIPLIER    = 0.25   -- scales camera Y gap between camera and root
+local CAM_FOCUS_MIN           = 0.6    -- min vertical focus offset (studs)
+local CAM_FOCUS_MAX           = 2.5    -- max vertical focus offset (studs)
+
+-- Legacy/world-space shiftlock nudge applied to facing (kept for compatibility)
+local CAM_OFFSET_RIGHT        = 2.25   -- additional right nudge applied to facing vector (studs)
+
+-- Targeting options
+local CAM_USE_CENTER_AIM      = true   -- true = aim uses camera center; false = use mouse
+
+local QD_RANGE        = 10
+local QD_FACE_LINGER  = 0.5
+local RAG_WATCH_WINDOW = 0.075
+local RAG_WATCH_Q_DELAY = 0.005
+local RLOCK_LERP_MIN  = 50
+local RLOCK_LERP_MAX  = 50
+local RLOCK_LERP_VEL  = 0.5
+local ARC_REBUILD_THRESHOLD = 0.5
+local VEL_SMOOTH_FACTOR = 0.15
+local POS_SMOOTH_FACTOR = 0.35
+local W_FACE_LERP       = 0.0001
+local RLOCK_PRED_TIME   = 0.10
+local QD_SIDE_TO_Q     = 0.02
+local QD_Q_TO_3       = 0.00
+local QD_SK_RELEASE   = 0.05
+local QD_SECOND_3     = 0.30
 
 local onCooldown  = false
 local onCooldownW = false
@@ -58,7 +85,7 @@ getgenv().__dashCleanup = function()
 end
 
 local targetCache = {}
-local rootToData  = {}  -- reverse map: HRP -> data, O(1) lookup
+local rootToData  = {}
 local playerConns = {}
 local diedConns   = {}
 
@@ -66,7 +93,6 @@ local function addModel(model)
     if model == player.Character then return end
     local hrp = model:FindFirstChild("HumanoidRootPart")
     local hum = model:FindFirstChildOfClass("Humanoid")
-    -- Retry until HRP and Humanoid exist (up to 2 seconds)
     if not hrp or not hum then
         task.spawn(function()
             local t = 0
@@ -151,8 +177,6 @@ onCleanup(function()
     diedConns = {}
 end)
 
-
--- Periodic rescan: catches anyone missed due to timing (every 3 seconds)
 trackActive(RunService.Heartbeat:Connect(function()
     local now = tick()
     if not getgenv().__lastRescan or now - getgenv().__lastRescan < 3 then return end
@@ -234,15 +258,23 @@ end
 local function press(key)   VIM:SendKeyEvent(true,  key, false, game) end
 local function release(key) VIM:SendKeyEvent(false, key, false, game) end
 
+-- getTarget supports optional camera-center aiming and small screen nudges for selection only
 local function getTarget(root, range)
-    local mousePos = UIS:GetMouseLocation()
+    local aimScreen
+    if CAM_USE_CENTER_AIM then
+        local vs = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+        aimScreen = Vector2.new(vs.X * 0.5 + CAM_AIM_SCREEN_RIGHT, vs.Y * 0.5 + CAM_AIM_SCREEN_UP)
+    else
+        aimScreen = UIS:GetMouseLocation()
+    end
+
     local closest, closestDist = nil, math.huge
     for model, data in pairs(targetCache) do
         if model.Parent and data.Humanoid.Health > 0 then
             local dist = (data.Root.Position - root.Position).Magnitude
             if dist <= range then
                 local screenPos = workspace.CurrentCamera:WorldToScreenPoint(data.Root.Position)
-                local sd = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                local sd = (Vector2.new(screenPos.X, screenPos.Y) - aimScreen).Magnitude
                 if sd < closestDist then
                     closestDist = sd
                     closest = data.Root
@@ -273,9 +305,8 @@ local rLockPaused = false
 local rLockTarget = nil
 local rLockConn   = nil
 local rHighlight  = nil
-local lastRLockTarget = nil  -- remembers target for auto-relock
+local lastRLockTarget = nil
 
--- Register stopRLock to run on re-execution
 onCleanup(function()
     if rHighlight then rHighlight:Destroy() rHighlight = nil end
     local c = player.Character
@@ -303,7 +334,7 @@ local function startRLock(target)
     hl.FillTransparency  = 0.5
     hl.Parent            = target.Parent
     rHighlight = hl
-    local smoothDir = nil  -- smoothed facing direction, velocity-weighted lerp
+    local smoothDir = nil
     rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
         if rLockPaused then return end
         if isRagdolled() then stopRLock() return end
@@ -320,7 +351,6 @@ local function startRLock(target)
         local rawDir  = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
         if rawDir.Magnitude > 0.01 then
             rawDir = rawDir.Unit
-            -- Velocity-based lerp speed: faster lerp when target moves fast, min 8 max 20
             local _tData = rootToData[rLockTarget]
             local spd = _tData and _tData.velocity.Magnitude or 0
             local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
@@ -334,8 +364,6 @@ local function startRLock(target)
     end))
 end
 
-
--- Auto-relock watcher: if C lock was active and ragdoll clears, relock onto same target
 local wasRagdolled = false
 trackActive(RunService.Heartbeat:Connect(function()
     local ragdolled = isRagdolled()
@@ -351,17 +379,27 @@ trackActive(RunService.Heartbeat:Connect(function()
     wasRagdolled = false
 end))
 
--- Camera Lock
+-- Camera Lock (applies POSITION offsets to camera anchor; aim facing still uses CAM_OFFSET_RIGHT)
 local function startCameraLock(root, target)
     local startTime = tick()
     local unlocked  = false
     local stepName  = "__dashCamLock__"
 
-    -- Snapshot pitch: clamp to reasonable range so ragdoll camera angles don't corrupt it
-    local lv = camera.CFrame.LookVector
+    -- Snapshot pitch at lock start and clamp away extreme ragdoll angles.
+    local lv   = camera.CFrame.LookVector
     local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
-    local rawPitch = hMag > 0.001 and (lv.Y / hMag) or 0
-    local tanPitch = math.clamp(rawPitch, -2, 0.5)  -- clamp: ignore extreme ragdoll camera angles
+    local pitchRad = math.clamp(
+        math.atan2(lv.Y, math.max(hMag, 0.001)),
+        -1.2, 0.5
+    )
+
+    -- Derive a vertical focus offset from the root at lock start.
+    local rawYGap    = camera.CFrame.Position.Y - root.Position.Y
+    local focusOffY  = math.clamp(rawYGap * CAM_FOCUS_MULTIPLIER, CAM_FOCUS_MIN, CAM_FOCUS_MAX) + CAM_POS_UP_OFFSET
+
+    -- Compute net horizontal offsets (right - left, forward - back)
+    local netRightOffset = CAM_POS_RIGHT_OFFSET - CAM_POS_LEFT_OFFSET
+    local netForwardOffset = CAM_POS_FORWARD_OFFSET - CAM_POS_BACK_OFFSET
 
     local function doUnlock()
         if unlocked then return end
@@ -371,45 +409,68 @@ local function startCameraLock(root, target)
 
     RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
         if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
-        local camPos = camera.CFrame.Position
-        
-        -- Y aim: use snapshotted pitch angle applied to current horizontal distance
-        local hDist  = Vector3.new(target.Position.X - camPos.X, 0, target.Position.Z - camPos.Z).Magnitude
-        local aimY   = camPos.Y + tanPitch * hDist
-        local baseAimPos = Vector3.new(target.Position.X, aimY, target.Position.Z)
-        
-        -- Calculate the right offset for shiftlock effect
-        local toAim = baseAimPos - camPos
-        if toAim.Magnitude > 0.01 then
-            local rightDir = Vector3.new(-toAim.Z, 0, toAim.X).Unit
-            local offsetAimPos = baseAimPos + rightDir * CAM_OFFSET_RIGHT
-            camera.CFrame = CFrame.lookAt(camPos, offsetAimPos)
-        else
-            camera.CFrame = CFrame.lookAt(camPos, baseAimPos)
+        local curCF = camera.CFrame
+
+        -- Build a lag-free anchor from root.Position and apply POSITION offsets (this moves the camera anchor).
+        local baseFocusPos = root.Position + Vector3.new(0, focusOffY, 0)
+
+        -- Determine horizontal direction toward target for relative offsets
+        local toH = Vector3.new(target.Position.X - baseFocusPos.X, 0, target.Position.Z - baseFocusPos.Z)
+        if toH.Magnitude <= 0.01 then
+            -- fallback: just set camera to look at target from baseFocusPos without offsets
+            local facingCF = CFrame.lookAt(baseFocusPos, target.Position)
+            local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
+            local zoomDist = math.max((curCF.Position - baseFocusPos).Magnitude, 0.5)
+            local correctCamPos = baseFocusPos - rotCF.LookVector * zoomDist
+            camera.CFrame = rotCF + (correctCamPos - baseFocusPos)
+            return
+        end
+
+        local forwardDir = toH.Unit
+        local rightDir = Vector3.new(-toH.Z, 0, toH.X).Unit
+
+        -- Apply POSITION offsets to the focus anchor (these move where the camera is anchored)
+        local focusPos = baseFocusPos
+            + rightDir * netRightOffset
+            + forwardDir * netForwardOffset
+
+        -- After moving the anchor, compute facing vector (optionally apply CAM_OFFSET_RIGHT to facing only)
+        local toH2 = Vector3.new(target.Position.X - focusPos.X, 0, target.Position.Z - focusPos.Z)
+        if toH2.Magnitude > 0.01 then
+            -- Apply facing nudge (legacy shiftlock feel) to the facing vector only (does NOT move anchor)
+            if CAM_OFFSET_RIGHT ~= 0 then
+                local rightDir2 = Vector3.new(-toH2.Z, 0, toH2.X).Unit
+                toH2 = toH2 + rightDir2 * CAM_OFFSET_RIGHT
+            end
+
+            -- Build full rotation: horizontal yaw toward target + snapshotted pitch
+            local facingCF = CFrame.lookAt(focusPos, focusPos + toH2)
+            local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
+
+            -- Step back from focusPos along the full look vector using current zoom distance
+            local zoomDist = math.max((curCF.Position - focusPos).Magnitude, 0.5)
+            local correctCamPos = focusPos - rotCF.LookVector * zoomDist
+            camera.CFrame = rotCF + (correctCamPos - focusPos)
         end
     end)
 
     return doUnlock
 end
 
--- Dash
 local function activate()
-    -- Snapshot everything upfront so sideKey is computed ONCE and reused everywhere
     local _holdW0 = keysHeld[Enum.KeyCode.W] == true
     local _holdS0 = keysHeld[Enum.KeyCode.S] == true
-    -- Bail before Q if on cooldown
     if _holdW0 and onCooldownW then return end
     if not _holdW0 and not _holdS0 and onCooldown then return end
     local _char0  = player.Character
     local _root0  = _char0 and _char0:FindFirstChild("HumanoidRootPart")
-    local _preSD  = nil  -- pre-computed sideDirection upvalue shared with delay body
-    local _preSK  = Enum.KeyCode.D  -- default
+    local _preSD  = nil
+    local _preSK  = Enum.KeyCode.D
     local _noKeys = not _holdW0 and not _holdS0 and not keysHeld[Enum.KeyCode.A] and not keysHeld[Enum.KeyCode.D]
-    -- Range check before pressing ANYTHING
     if _root0 and not _holdS0 then
         local _range = _holdW0 and MAX_RANGE_W or MAX_RANGE
         local _tgt0  = getTarget(_root0, _range)
-        if not _tgt0 then return end  -- out of range, no Q, no nothing
+        if not _tgt0 then return end
         if _noKeys then
             local _tp0 = Vector3.new(_tgt0.Position.X, _root0.Position.Y, _tgt0.Position.Z)
             local _to0 = (_tp0 - _root0.Position)
@@ -419,14 +480,12 @@ local function activate()
                 _preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
             end
             press(_preSK)
-            task.delay(QD_SIDE_TO_Q,               function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
-            task.delay(QD_SK_RELEASE,              function() release(_preSK) end)
+            task.delay(QD_SIDE_TO_Q,  function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
+            task.delay(QD_SK_RELEASE, function() release(_preSK) end)
         else
-            -- W/A/D held: just Q
             press(Enum.KeyCode.Q) release(Enum.KeyCode.Q)
         end
     else
-        -- S dash: check range, then Q
         local _tgt0 = _root0 and getTarget(_root0, math.huge) or nil
         if not _tgt0 then return end
         press(Enum.KeyCode.Q) release(Enum.KeyCode.Q)
@@ -434,7 +493,6 @@ local function activate()
     local _ragWatchStart = nil
     local _ragWatchFired = false
     local _ragWatchConn
-    -- Start timing from when Q fires so ragdoll cancel has time to register
     task.delay(QD_SIDE_TO_Q + RAG_WATCH_Q_DELAY, function() _ragWatchStart = tick() end)
     _ragWatchConn = trackActive(RunService.Heartbeat:Connect(function()
         if not _ragWatchStart then return end
@@ -479,8 +537,6 @@ local function activate()
     local hum = char:FindFirstChildOfClass("Humanoid")
 
     local startPos = root.Position
-
-    -- Use pre-computed side from upvalue — same as what was already pressed
     local initTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
     local initTo     = (initTarget - startPos)
     if initTo.Magnitude < 0.01 then return end
@@ -494,11 +550,9 @@ local function activate()
     local connection
 
     if holdingW then
-        -- W dash: track target live each frame, always end to their right
         if hum then hum.AutoRotate = false end
         rLockPaused = true
 
-        -- Estimate initial total length for progress tracking
         local initPerp2 = Vector3.new(-initTo.Z, 0, initTo.X)
         local initFinal = initTarget + initPerp2 * sideDirection * W_SIDE_OFFSET + initTo * W_FORWARD_OFFSET
         local totalLen  = (initFinal - startPos).Magnitude
@@ -506,7 +560,6 @@ local function activate()
         connection = trackActive(RunService.Heartbeat:Connect(function(dt)
             if isRagdolled() then connection:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
 
-            -- Recompute destination only when target moves meaningfully (saves fps)
             local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
             local liveToTgt  = (liveTarget - startPos)
             if liveToTgt.Magnitude < 0.01 then return end
@@ -545,7 +598,6 @@ local function activate()
                 return
             end
 
-            -- Move along line toward live final pos
             local moveDir = (finalPos - startPos)
             if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
             local pos = startPos + moveDir * traveled
@@ -555,7 +607,6 @@ local function activate()
             )
         end))
     else
-        -- Side dash: rebuild arc every frame toward live target position
         local distance   = (initTarget - startPos).Magnitude
         local archWidth  = ARCH_WIDTH_MIN + (distance / MAX_RANGE) * (ARCH_WIDTH_MAX - ARCH_WIDTH_MIN)
         local initPerp   = Vector3.new(-initTo.Z, 0, initTo.X)
@@ -569,13 +620,12 @@ local function activate()
             applyFacing(root, hum, target)
         end))
         local unlockCam = startCameraLock(root, target)
-    local yVel = 0  -- track Y velocity for gravity during tween
-    local GRAVITY = -196.2  -- studs/s^2 (Roblox default workspace gravity)
+        local yVel = 0
+        local GRAVITY = -196.2
 
         connection = trackActive(RunService.Heartbeat:Connect(function(dt)
             if isRagdolled() then connection:Disconnect() facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
 
-            -- Rebuild arc only when target moves meaningfully (saves fps)
             local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
             local liveToTgt  = (liveTarget - startPos)
             if liveToTgt.Magnitude > 0.01 then
@@ -632,11 +682,9 @@ local function activate()
     task.delay(holdingW and COOLDOWN_W or COOLDOWN, function()
         if holdingW then onCooldownW = false else onCooldown = false end
     end)
-    end)) -- end ragdoll watcher
+    end))
 end
 
-
--- Quick dash (MouseButton3): sideKey+Q + facing, no tween, 0.5s linger, no stack
 local function quickDash()
     if isRagdolled() then return end
     local char = player.Character
@@ -644,9 +692,8 @@ local function quickDash()
     if not root then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
     local target = getTarget(root, QD_RANGE)
-    if not target then return end  -- out of range: no keys pressed at all
+    if not target then return end
 
-    -- Compute side from camera
     local tp = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
     local to = (tp - root.Position)
     if to.Magnitude < 0.01 then return end
@@ -655,10 +702,10 @@ local function quickDash()
     local sk = sd == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 
     press(sk)
-    task.delay(QD_SIDE_TO_Q,                   function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
-    task.delay(QD_SIDE_TO_Q + QD_Q_TO_3,        function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
-    task.delay(QD_SK_RELEASE,                    function() release(sk) end)
-    task.delay(QD_SECOND_3,                      function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
+    task.delay(QD_SIDE_TO_Q,             function() press(Enum.KeyCode.Q) release(Enum.KeyCode.Q) end)
+    task.delay(QD_SIDE_TO_Q + QD_Q_TO_3, function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
+    task.delay(QD_SK_RELEASE,            function() release(sk) end)
+    task.delay(QD_SECOND_3,              function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
 
     startCameraLock(root, target)
     local startTime = tick()
@@ -687,7 +734,7 @@ local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
         quickDash()
     elseif input.KeyCode == Enum.KeyCode.C then
         if rLockActive then
-            lastRLockTarget = nil  -- manual unlock clears memory
+            lastRLockTarget = nil
             stopRLock()
         else
             local char = getCharacter()
