@@ -30,8 +30,8 @@ local CAM_LOCK_DURATION = 0.55
 -- ---------------------------
 -- These change the camera's anchored position during the lock (NOT the aim).
 -- All values are in studs except screen offsets which are pixels.
-local CAM_POS_UP_OFFSET       = 0    -- additional vertical offset added to camera anchor (studs)
-local CAM_POS_RIGHT_OFFSET    = 2   -- world-space right offset relative to target direction (studs)
+local CAM_POS_UP_OFFSET       = 1.50    -- additional vertical offset added to camera anchor (studs)
+local CAM_POS_RIGHT_OFFSET    = 2.1   -- world-space right offset relative to target direction (studs)
 local CAM_POS_LEFT_OFFSET     = 0      -- alternative left offset (studs); net right = right - left
 local CAM_POS_FORWARD_OFFSET  = 0      -- push camera anchor toward the target (studs)
 local CAM_POS_BACK_OFFSET     = 0      -- push camera anchor away from the target (studs); net forward = forward - back
@@ -42,8 +42,8 @@ local CAM_AIM_SCREEN_UP       = 0      -- screen pixels; positive nudges aim sel
 
 -- Vertical focus calculation tunables (used to compute base camera anchor height)
 local CAM_FOCUS_MULTIPLIER    = 0.25   -- scales camera Y gap between camera and root
-local CAM_FOCUS_MIN           = 0.6    -- min vertical focus offset (studs)
-local CAM_FOCUS_MAX           = 2.5    -- max vertical focus offset (studs)
+local CAM_FOCUS_MIN           = 0    -- min vertical focus offset (studs)
+local CAM_FOCUS_MAX           = 0    -- max vertical focus offset (studs)
 
 -- Legacy/world-space shiftlock nudge applied to facing (kept for compatibility)
 local CAM_OFFSET_RIGHT        = 2.25   -- additional right nudge applied to facing vector (studs)
@@ -385,14 +385,6 @@ local function startCameraLock(root, target)
     local unlocked  = false
     local stepName  = "__dashCamLock__"
 
-    -- Snapshot pitch at lock start and clamp away extreme ragdoll angles.
-    local lv   = camera.CFrame.LookVector
-    local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
-    local pitchRad = math.clamp(
-        math.atan2(lv.Y, math.max(hMag, 0.001)),
-        -1.2, 0.5
-    )
-
     -- Derive a vertical focus offset from the root at lock start.
     local rawYGap    = camera.CFrame.Position.Y - root.Position.Y
     local focusOffY  = math.clamp(rawYGap * CAM_FOCUS_MULTIPLIER, CAM_FOCUS_MIN, CAM_FOCUS_MAX) + CAM_POS_UP_OFFSET
@@ -410,6 +402,14 @@ local function startCameraLock(root, target)
     RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
         if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
         local curCF = camera.CFrame
+
+        -- Snapshot pitch DYNAMICALLY during the lock so the player can continue looking up/down
+        local lv   = curCF.LookVector
+        local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+        local pitchRad = math.clamp(
+            math.atan2(lv.Y, math.max(hMag, 0.001)),
+            -1.2, 0.5
+        )
 
         -- Build a lag-free anchor from root.Position and apply POSITION offsets (this moves the camera anchor).
         local baseFocusPos = root.Position + Vector3.new(0, focusOffY, 0)
@@ -443,7 +443,7 @@ local function startCameraLock(root, target)
                 toH2 = toH2 + rightDir2 * CAM_OFFSET_RIGHT
             end
 
-            -- Build full rotation: horizontal yaw toward target + snapshotted pitch
+            -- Build full rotation: horizontal yaw toward target + live pitch from user
             local facingCF = CFrame.lookAt(focusPos, focusPos + toH2)
             local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
 
