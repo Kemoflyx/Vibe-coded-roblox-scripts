@@ -1,7 +1,23 @@
 local RunService = game:GetService("RunService")
 
-local originalRates = {}
-local accumulators  = {}
+-- Disconnect old connections if the script is re-executed
+if getgenv().GraphicsPatcher then
+    pcall(function()
+        getgenv().GraphicsPatcher.AddedConnection:Disconnect()
+        getgenv().GraphicsPatcher.RemovingConnection:Disconnect()
+        getgenv().GraphicsPatcher.HeartbeatConnection:Disconnect()
+    end)
+end
+
+-- Initialize the global environment table
+getgenv().GraphicsPatcher = {
+    originalRates = {},
+    accumulators = {}
+}
+
+local env = getgenv().GraphicsPatcher
+local originalRates = env.originalRates
+local accumulators = env.accumulators
 
 local function patchParticle(obj)
     if not obj:IsA("ParticleEmitter") then return end
@@ -13,9 +29,9 @@ local function patchParticle(obj)
     originalRates[obj] = rate
     accumulators[obj]  = 0
 
-    pcall(function() obj.Rate      = 0                        end)
+    pcall(function() obj.Rate       = 0                        end)
     pcall(function() obj.Brightness = math.max(obj.Brightness, 1) end)
-    pcall(function() obj.TimeScale  = 1                       end)
+    pcall(function() obj.TimeScale  = 1                        end)
 end
 
 local function patchBeam(obj)
@@ -34,17 +50,21 @@ local function patch(obj)
     patchLight(obj)
 end
 
+-- Initial patch
 for _, obj in ipairs(game.Workspace:GetDescendants()) do patch(obj) end
 for _, obj in ipairs(game:GetService("Lighting"):GetDescendants()) do patch(obj) end
 
-game.DescendantAdded:Connect(function(obj) task.defer(patch, obj) end)
+-- Save connections to getgenv() so they can be cleaned up on re-execution
+env.AddedConnection = game.DescendantAdded:Connect(function(obj) 
+    task.defer(patch, obj) 
+end)
 
-game.DescendantRemoving:Connect(function(obj)
+env.RemovingConnection = game.DescendantRemoving:Connect(function(obj)
     originalRates[obj] = nil
     accumulators[obj]  = nil
 end)
 
-RunService.Heartbeat:Connect(function(dt)
+env.HeartbeatConnection = RunService.Heartbeat:Connect(function(dt)
     local safe_dt = math.min(dt, 0.1)
 
     for emitter, rate in pairs(originalRates) do
