@@ -1,64 +1,93 @@
--- Prevent the script from running multiple times and stacking events
-if getgenv().VFXKillerLoaded then 
-    return 
-end
-getgenv().VFXKillerLoaded = true
+local RunService = game:GetService("RunService")
 
-local Players = game:GetService("Players")
-
-local INVISIBLE_SEQ = NumberSequence.new(1)
-local ZERO_SEQ      = NumberSequence.new(0)
-
--- Assigning the kill function to the global environment
-getgenv().KillVFX = function(obj)
-    if obj:IsA("ParticleEmitter") then
-        pcall(function() obj.Enabled      = false         end)
-        pcall(function() obj.Rate         = 0             end)
-        pcall(function() obj.Transparency = INVISIBLE_SEQ end)
-        pcall(function() obj.Size         = ZERO_SEQ      end)
-        pcall(function() obj:Clear()                      end)
-
-    elseif obj:IsA("Trail") then
-        pcall(function() obj.Enabled      = false         end)
-        pcall(function() obj.Transparency = INVISIBLE_SEQ end)
-        pcall(function() obj.WidthScale   = ZERO_SEQ      end)
-
-    elseif obj:IsA("Beam") then
-        pcall(function() obj.Enabled      = false end)
-        pcall(function() obj.Transparency = 1     end)
-        pcall(function() obj.Width0       = 0     end)
-        pcall(function() obj.Width1       = 0     end)
-
-    elseif obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
-        pcall(function() obj.Enabled = false end)
-
-    elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
-        pcall(function() obj.Enabled = false end)
-    end
+-- Disconnect old connections if the script is re-executed
+if getgenv().GraphicsPatcher then
+    pcall(function()
+        getgenv().GraphicsPatcher.AddedConnection:Disconnect()
+        getgenv().GraphicsPatcher.RemovingConnection:Disconnect()
+        getgenv().GraphicsPatcher.HeartbeatConnection:Disconnect()
+    end)
 end
 
--- Assigning the scanning function to the global environment
-getgenv().ScanRootVFX = function(root)
-    for _, obj in ipairs(root:GetDescendants()) do 
-        getgenv().KillVFX(obj) 
-    end
+-- Initialize the global environment table
+getgenv().GraphicsPatcher = {
+    originalRates = {},
+    accumulators = {}
+}
+
+local env = getgenv().GraphicsPatcher
+local originalRates = env.originalRates
+local accumulators = env.accumulators
+
+local function patchParticle(obj)
+    if not obj:IsA("ParticleEmitter") then return end
+    if originalRates[obj] then return end
+
+    local rate = obj.Rate
+    if rate <= 0 then return end
+
+    originalRates[obj] = rate
+    accumulators[obj]  = 0
+
+    pcall(function() obj.Rate       = 0                        end)
+    pcall(function() obj.Brightness = math.max(obj.Brightness, 1) end)
+    pcall(function() obj.TimeScale  = 1                        end)
 end
 
--- Perform the initial scan
-getgenv().ScanRootVFX(game:GetService("Workspace"))
-getgenv().ScanRootVFX(game:GetService("Lighting"))
+local function patchBeam(obj)
+    if not obj:IsA("Beam") then return end
+    pcall(function() obj.Segments = math.max(obj.Segments, 10) end)
+end
 
--- Hook up connections and store them in getgenv() in case you ever want to disconnect them later
-getgenv().VFXDescendantConnection = game.DescendantAdded:Connect(function(obj) 
-    task.defer(getgenv().KillVFX, obj) 
+local function patchLight(obj)
+    if not (obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight")) then return end
+    pcall(function() obj.Shadows = true end)
+end
+
+local function patch(obj)
+    patchParticle(obj)
+    patchBeam(obj)
+    patchLight(obj)
+end
+
+-- Initial patch
+for _, obj in ipairs(game.Workspace:GetDescendants()) do patch(obj) end
+for _, obj in ipairs(game:GetService("Lighting"):GetDescendants()) do patch(obj) end
+
+-- Save connections to getgenv() so they can be cleaned up on re-execution
+env.AddedConnection = game.DescendantAdded:Connect(function(obj) 
+    task.defer(patch, obj) 
 end)
 
-local lp = Players.LocalPlayer
-if lp then
-    getgenv().VFXCharConnection = lp.CharacterAdded:Connect(function(char) 
-        task.defer(getgenv().ScanRootVFX, char) 
-    end)
-    if lp.Character then 
-        getgenv().ScanRootVFX(lp.Character) 
+env.RemovingConnection = game.DescendantRemoving:Connect(function(obj)
+    originalRates[obj] = nil
+    accumulators[obj]  = nil
+end)
+
+env.HeartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+    local safe_dt = math.min(dt, 0.1)
+
+    for emitter, rate in pairs(originalRates) do
+        if not emitter.Parent then
+            originalRates[emitter] = nil
+            accumulators[emitter]  = nil
+            continue
+        end
+
+        if not emitter.Enabled then
+            accumulators[emitter] = 0
+            continue
+        end
+
+        local acc      = accumulators[emitter] + safe_dt
+        local interval = 1 / rate
+
+        if acc >= interval then
+            local count = math.floor(acc / interval)
+            acc = acc - (count * interval)
+            pcall(function() emitter:Emit(count) end)
+        end
+
+        accumulators[emitter] = acc
     end
-end
+end)
