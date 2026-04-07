@@ -1,9 +1,16 @@
+-- Prevent the script from running multiple times and stacking events
+if getgenv().VFXKillerLoaded then 
+    return 
+end
+getgenv().VFXKillerLoaded = true
+
 local Players = game:GetService("Players")
 
 local INVISIBLE_SEQ = NumberSequence.new(1)
 local ZERO_SEQ      = NumberSequence.new(0)
 
-local function kill(obj)
+-- Assigning the kill function to the global environment
+getgenv().KillVFX = function(obj)
     if obj:IsA("ParticleEmitter") then
         pcall(function() obj.Enabled      = false         end)
         pcall(function() obj.Rate         = 0             end)
@@ -30,17 +37,28 @@ local function kill(obj)
     end
 end
 
-local function scanRoot(root)
-    for _, obj in ipairs(root:GetDescendants()) do kill(obj) end
+-- Assigning the scanning function to the global environment
+getgenv().ScanRootVFX = function(root)
+    for _, obj in ipairs(root:GetDescendants()) do 
+        getgenv().KillVFX(obj) 
+    end
 end
 
-scanRoot(game.Workspace)
-scanRoot(game:GetService("Lighting"))
+-- Perform the initial scan
+getgenv().ScanRootVFX(game:GetService("Workspace"))
+getgenv().ScanRootVFX(game:GetService("Lighting"))
 
-game.DescendantAdded:Connect(function(obj) task.defer(kill, obj) end)
+-- Hook up connections and store them in getgenv() in case you ever want to disconnect them later
+getgenv().VFXDescendantConnection = game.DescendantAdded:Connect(function(obj) 
+    task.defer(getgenv().KillVFX, obj) 
+end)
 
 local lp = Players.LocalPlayer
 if lp then
-    lp.CharacterAdded:Connect(function(char) task.defer(scanRoot, char) end)
-    if lp.Character then scanRoot(lp.Character) end
+    getgenv().VFXCharConnection = lp.CharacterAdded:Connect(function(char) 
+        task.defer(getgenv().ScanRootVFX, char) 
+    end)
+    if lp.Character then 
+        getgenv().ScanRootVFX(lp.Character) 
+    end
 end
