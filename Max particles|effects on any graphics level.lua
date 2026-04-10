@@ -1,93 +1,81 @@
 local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local Lighting   = game:GetService("Lighting")
 
--- Disconnect old connections if the script is re-executed
+local Cache = setmetatable({}, { __mode = "k" })
+
 if getgenv().GraphicsPatcher then
-    pcall(function()
-        getgenv().GraphicsPatcher.AddedConnection:Disconnect()
-        getgenv().GraphicsPatcher.RemovingConnection:Disconnect()
-        getgenv().GraphicsPatcher.HeartbeatConnection:Disconnect()
-    end)
+    for _, v in pairs(getgenv().GraphicsPatcher.Conns) do v:Disconnect() end
 end
-
--- Initialize the global environment table
-getgenv().GraphicsPatcher = {
-    originalRates = {},
-    accumulators = {}
-}
-
-local env = getgenv().GraphicsPatcher
-local originalRates = env.originalRates
-local accumulators = env.accumulators
-
-local function patchParticle(obj)
-    if not obj:IsA("ParticleEmitter") then return end
-    if originalRates[obj] then return end
-
-    local rate = obj.Rate
-    if rate <= 0 then return end
-
-    originalRates[obj] = rate
-    accumulators[obj]  = 0
-
-    pcall(function() obj.Rate       = 0                        end)
-    pcall(function() obj.Brightness = math.max(obj.Brightness, 1) end)
-    pcall(function() obj.TimeScale  = 1                        end)
-end
-
-local function patchBeam(obj)
-    if not obj:IsA("Beam") then return end
-    pcall(function() obj.Segments = math.max(obj.Segments, 10) end)
-end
-
-local function patchLight(obj)
-    if not (obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight")) then return end
-    pcall(function() obj.Shadows = true end)
-end
+getgenv().GraphicsPatcher = { Conns = {} }
+local Conns = getgenv().GraphicsPatcher.Conns
 
 local function patch(obj)
-    patchParticle(obj)
-    patchBeam(obj)
-    patchLight(obj)
+    if Cache[obj] then return end
+    if obj:IsA("ParticleEmitter") then
+        local originalRate = obj.Rate
+        if originalRate > 0 then
+            Cache[obj] = { rate = originalRate, acc = 0 }
+            obj.Rate = 0
+            obj.Brightness = math.max(obj.Brightness, 1.5)
+        end
+    elseif obj:IsA("Beam") then
+        Cache[obj] = true
+        obj.Segments = math.max(obj.Segments, 10)
+    elseif obj:IsA("Light") then
+        Cache[obj] = true
+        obj.Shadows = true
+    end
 end
 
--- Initial patch
-for _, obj in ipairs(game.Workspace:GetDescendants()) do patch(obj) end
-for _, obj in ipairs(game:GetService("Lighting"):GetDescendants()) do patch(obj) end
-
--- Save connections to getgenv() so they can be cleaned up on re-execution
-env.AddedConnection = game.DescendantAdded:Connect(function(obj) 
-    task.defer(patch, obj) 
-end)
-
-env.RemovingConnection = game.DescendantRemoving:Connect(function(obj)
-    originalRates[obj] = nil
-    accumulators[obj]  = nil
-end)
-
-env.HeartbeatConnection = RunService.Heartbeat:Connect(function(dt)
-    local safe_dt = math.min(dt, 0.1)
-
-    for emitter, rate in pairs(originalRates) do
-        if not emitter.Parent then
-            originalRates[emitter] = nil
-            accumulators[emitter]  = nil
-            continue
-        end
-
-        if not emitter.Enabled then
-            accumulators[emitter] = 0
-            continue
-        end
-
-        local acc      = accumulators[emitter] + safe_dt
-        local interval = 1 / rate
-
-        if acc >= interval then
-            local count = math.floor(acc / interval)
-            acc = acc - (count * interval)
-            pcall(function() emitter:Emit(count) end)
-        end
-
-        accumulators[emitter] = acc
+local function safeScan(root)
+    local descendants = root:GetDescendants()
+    for i = 1, #descendants do
+        patch(descendants[i])
+        if i % 200 == 0 then task.wait() end
     end
-end)
+end
+
+task.spawn(safeScan, Workspace)
+task.spawn(safeScan, Lighting)
+
+table.insert(Conns, Workspace.DescendantAdded:Connect(patch))
+table.insert(Conns, Lighting.DescendantAdded:Connect(patch))
+
+local deadKeys = {}
+
+table.insert(Conns, RunService.Heartbeat:Connect(function(dt)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local camPos = cam.CFrame.Position
+    dt = math.min(dt, 0.1)
+
+    for emitter, data in pairs(Cache) do
+        -- Prune dead entries right here instead of letting them pile up
+        if not emitter.Parent then
+            deadKeys[#deadKeys + 1] = emitter
+            continue
+        end
+
+        if type(data) ~= "table" or not emitter.Enabled then continue end
+
+        local parent = emitter.Parent
+        if parent:IsA("BasePart") then
+            if (parent.Position - camPos).Magnitude > 150 then continue end
+        end
+
+        data.acc = data.acc + dt
+        local interval = 1 / data.rate
+        if data.acc >= interval then
+            local count = math.floor(data.acc / interval)
+            data.acc = data.acc - (count * interval)
+            emitter:Emit(count)
+        end
+    end
+
+    -- Flush dead entries accumulated this frame
+    for i = 1, #deadKeys do
+        Cache[deadKeys[i]] = nil
+        deadKeys[i] = nil
+    end
+end))
