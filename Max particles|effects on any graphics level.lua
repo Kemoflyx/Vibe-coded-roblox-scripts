@@ -17,7 +17,6 @@ local function patch(obj)
         if originalRate > 0 then
             Cache[obj] = { rate = originalRate, acc = 0 }
             obj.Rate = 0
-            obj.Brightness = math.max(obj.Brightness, 1.5)
         end
     elseif obj:IsA("Beam") then
         Cache[obj] = true
