@@ -1,64 +1,57 @@
--- Prevent the script from running multiple times and stacking events
+-- Prevent the script from running multiple times
 if getgenv().VFXKillerLoaded then 
     return 
 end
 getgenv().VFXKillerLoaded = true
 
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 
-local INVISIBLE_SEQ = NumberSequence.new(1)
-local ZERO_SEQ      = NumberSequence.new(0)
-
--- Assigning the kill function to the global environment
-getgenv().KillVFX = function(obj)
+-- Localized function so the engine doesn't have to search the global environment
+local function killVFX(obj)
+    -- Grouped checks using inheritance where possible
     if obj:IsA("ParticleEmitter") then
-        pcall(function() obj.Enabled      = false         end)
-        pcall(function() obj.Rate         = 0             end)
-        pcall(function() obj.Transparency = INVISIBLE_SEQ end)
-        pcall(function() obj.Size         = ZERO_SEQ      end)
-        pcall(function() obj:Clear()                      end)
-
-    elseif obj:IsA("Trail") then
-        pcall(function() obj.Enabled      = false         end)
-        pcall(function() obj.Transparency = INVISIBLE_SEQ end)
-        pcall(function() obj.WidthScale   = ZERO_SEQ      end)
-
-    elseif obj:IsA("Beam") then
-        pcall(function() obj.Enabled      = false end)
-        pcall(function() obj.Transparency = 1     end)
-        pcall(function() obj.Width0       = 0     end)
-        pcall(function() obj.Width1       = 0     end)
-
-    elseif obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
-        pcall(function() obj.Enabled = false end)
-
-    elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
-        pcall(function() obj.Enabled = false end)
+        obj.Enabled = false
+        obj:Clear() -- Wipes existing particles immediately
+        
+    elseif obj:IsA("Trail") or obj:IsA("Beam") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+        obj.Enabled = false
+        
+    elseif obj:IsA("Light") then -- 'Light' is the base class for Point, Spot, and Surface lights
+        obj.Enabled = false
     end
 end
 
--- Assigning the scanning function to the global environment
-getgenv().ScanRootVFX = function(root)
-    for _, obj in ipairs(root:GetDescendants()) do 
-        getgenv().KillVFX(obj) 
+local function scanRoot(root)
+    -- Generalized iteration is faster than ipairs
+    for _, obj in root:GetDescendants() do 
+        killVFX(obj) 
     end
 end
 
--- Perform the initial scan
-getgenv().ScanRootVFX(game:GetService("Workspace"))
-getgenv().ScanRootVFX(game:GetService("Lighting"))
+-- Perform the initial scan only on visual areas
+scanRoot(Workspace)
+scanRoot(Lighting)
 
--- Hook up connections and store them in getgenv() in case you ever want to disconnect them later
-getgenv().VFXDescendantConnection = game.DescendantAdded:Connect(function(obj) 
-    task.defer(getgenv().KillVFX, obj) 
+-- Hook up connections strictly to Workspace and Lighting to prevent UI/Core GUI lag
+getgenv().VFXWorkspaceConnection = Workspace.DescendantAdded:Connect(function(obj) 
+    task.defer(killVFX, obj) 
 end)
 
+getgenv().VFXLightingConnection = Lighting.DescendantAdded:Connect(function(obj) 
+    task.defer(killVFX, obj) 
+end)
+
+-- Character handling
 local lp = Players.LocalPlayer
 if lp then
     getgenv().VFXCharConnection = lp.CharacterAdded:Connect(function(char) 
-        task.defer(getgenv().ScanRootVFX, char) 
+        -- scanRoot inherently covers descendants, no need to wait for them to load individually
+        task.defer(scanRoot, char) 
     end)
+    
     if lp.Character then 
-        getgenv().ScanRootVFX(lp.Character) 
+        scanRoot(lp.Character) 
     end
 end
