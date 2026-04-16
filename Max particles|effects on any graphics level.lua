@@ -42,7 +42,7 @@ local function patch(obj)
         
     elseif obj:IsA("Light") then
         -- WARNING: If you want better FPS, set this to FALSE. True will tank performance.
-        obj.Shadows = true 
+        obj.Shadows = false 
     end
 end
 
