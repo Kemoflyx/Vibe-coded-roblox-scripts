@@ -1,6 +1,6 @@
 -- SETTINGS: Change this and re-run the script to update live!
 _G.ParticleLevel = 10 -- Range 1 to 10
-_G.MaxDistance   = 250 -- Particles further than this won't render
+_G.MaxDistance   = 100 -- Particles further than this won't render
 
 local RunService = game:GetService("RunService")
 local Workspace  = game:GetService("Workspace")
