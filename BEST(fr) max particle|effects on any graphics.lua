@@ -1,45 +1,62 @@
 local UserSettings = UserSettings():GetService("UserGameSettings")
-local min = math.min
 
+-- Using a weak table ensures that when an emitter is destroyed, 
+-- it gets garbage collected automatically without memory leaks.
 shared.OriginalRates = shared.OriginalRates or setmetatable({}, { __mode = "k" })
 local OriginalRates = shared.OriginalRates
 
-local scaleMap = {0.1, 0.2, 0.3, 0.45, 0.6, 0.75, 0.85, 0.92, 0.96, 1.0}
+local robloxScaleMap = {
+    [1] = 0.1, [2] = 0.2, [3] = 0.3, [4] = 0.45, [5] = 0.6,
+    [6] = 0.75, [7] = 0.85, [8] = 0.92, [9] = 0.96, [10] = 1.0
+}
 
-local lastScale = -1
 local currentScale = 1.0
 
+-- Calculates the rate for a specific emitter
 local function applyRate(emitter, originalRate)
-    local r = min(originalRate * 10, originalRate / currentScale)
-    if emitter.Rate ~= r then emitter.Rate = r end
+    local targetRate = originalRate / currentScale
+    local finalRate = math.min(originalRate * 10, targetRate)
+    
+    if emitter.Rate ~= finalRate then
+        emitter.Rate = finalRate
+    end
 end
 
-local function updateParticles()
+-- Updates our scale multiplier
+local function updateScale()
     local qLevel = UserSettings.SavedQualityLevel.Value
-    currentScale = scaleMap[qLevel ~= 0 and qLevel or 10] or 1.0
-    if currentScale == lastScale then return end
-    lastScale = currentScale
+    if qLevel == 0 then qLevel = 10 end -- Handle "Automatic" setting
+    currentScale = robloxScaleMap[qLevel] or 1.0
+end
+
+-- Pushes the new rate to all cached emitters
+local function updateAllEmitters()
     for emitter, originalRate in pairs(OriginalRates) do
         applyRate(emitter, originalRate)
     end
 end
 
+-- Registers a new emitter and instantly scales it
 local function register(obj)
     if obj:IsA("ParticleEmitter") and not OriginalRates[obj] then
-        local rate = obj.Rate
-        OriginalRates[obj] = rate
-        applyRate(obj, rate)
+        OriginalRates[obj] = obj.Rate 
+        applyRate(obj, obj.Rate)
     end
 end
 
-local function unregister(obj)
-    if OriginalRates[obj] then
-        OriginalRates[obj] = nil
-    end
-end
+-- 1. Initial setup calculation
+updateScale()
 
+-- 2. ONLY run the math when the player changes their graphics slider
+UserSettings:GetPropertyChangedSignal("SavedQualityLevel"):Connect(function()
+    updateScale()
+    updateAllEmitters()
+end)
+
+-- 3. Hook onto new descendants and scan existing ones
 workspace.DescendantAdded:Connect(register)
-workspace.DescendantRemoving:Connect(unregister)
-for _, v in pairs(workspace:GetDescendants()) do register(v) end
-UserSettings:GetPropertyChangedSignal("SavedQualityLevel"):Connect(updateParticles)
-updateParticles()
+
+-- Use ipairs instead of pairs for GetDescendants() as it's slightly faster for arrays
+for _, v in ipairs(workspace:GetDescendants()) do 
+    register(v) 
+end
