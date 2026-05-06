@@ -13,11 +13,21 @@ local math_rad, math_clamp, math_max = math.rad, math.clamp, math.max
 local LP = Players.LocalPlayer
 local Cam = workspace.CurrentCamera
 
--- Cleanup Logic
+-- Global Settings
+getgenv().CF = getgenv().CF or {
+    Enabled = true,
+    Target = "Head",
+    Sens = 0.4,
+    Keybind = Enum.KeyCode.Z
+}
+local CF = getgenv().CF
+
+-- Backup Logic
+local OriginalUpdate = nil
+local CameraController = nil
+
 local function Disconnect(conn)
-    if conn then
-        local success, err = pcall(function() conn:Disconnect() end)
-    end
+    if conn then pcall(function() conn:Disconnect() end) end
 end
 
 if getgenv().CF_Connections then
@@ -25,42 +35,34 @@ if getgenv().CF_Connections then
 end
 getgenv().CF_Connections = {}
 
-if getgenv().RigidConn then Disconnect(getgenv().RigidConn); getgenv().RigidConn = nil end
-if getgenv().CF_Gui then pcall(function() getgenv().CF_Gui:Destroy() end); getgenv().CF_Gui = nil end
-
--- Settings
-getgenv().CF = getgenv().CF or {
-    Enabled = true,
-    Target = "Head",
-    Sens = 0.4
-}
-local CF = getgenv().CF
-
 local function trackConn(c)
     table.insert(getgenv().CF_Connections, c)
     return c
 end
 
--- Camera Logic
-local function LobotomizeCamera()
+-- Camera Hijack/Restore
+local function ToggleCameraLobotomy(enable)
     local PlayerScripts = LP:FindFirstChild("PlayerScripts")
-    if not PlayerScripts then return end
-    
-    local PlayerModule = PlayerScripts:FindFirstChild("PlayerModule")
+    local PlayerModule = PlayerScripts and PlayerScripts:FindFirstChild("PlayerModule")
     if not PlayerModule then return end
     
     local success, module = pcall(require, PlayerModule)
     if success then
         local CameraModule = module:GetCameras()
         if CameraModule and CameraModule.activeCameraController then
-            CameraModule.activeCameraController.Update = function()
-                return Cam.CFrame, Cam.Focus
+            CameraController = CameraModule.activeCameraController
+            if not OriginalUpdate then OriginalUpdate = CameraController.Update end
+            
+            if enable then
+                CameraController.Update = function() return Cam.CFrame, Cam.Focus end
+            else
+                if OriginalUpdate then CameraController.Update = OriginalUpdate end
             end
         end
     end
 end
 
-LobotomizeCamera()
+if CF.Enabled then ToggleCameraLobotomy(true) end
 
 -- Input State
 local RotX, RotY, Zoom = 0, 0, 12
@@ -69,6 +71,11 @@ local RMBHeld = false
 
 trackConn(UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
+    if input.KeyCode == CF.Keybind then
+        CF.Enabled = not CF.Enabled
+        ToggleCameraLobotomy(CF.Enabled)
+        if getgenv().UpdateCFUI then getgenv().UpdateCFUI() end
+    end
     if input.UserInputType == Enum.UserInputType.MouseButton2 then
         RMBHeld = true
         UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
@@ -97,126 +104,125 @@ trackConn(UserInputService.InputChanged:Connect(function(input, processed)
     end
 end))
 
--- Caching & Rendering
-local Cache = { Char = nil, TargetMode = nil, HRP = nil, Hum = nil, Part = nil, Offset = 0 }
+-- Cache & Collision
+local Cache = { Subject = nil, TargetMode = nil, Hum = nil, Part = nil, Offset = 0 }
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 
+local function getIgnoredInstances()
+    local ignored = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then table.insert(ignored, player.Character) end
+    end
+    return ignored
+end
+
 local function updateCache()
-    local char = LP.Character
-    if not char or not char:IsDescendantOf(workspace) then return end
+    local subject = Cam.CameraSubject
+    local char = (subject and subject:IsA("Humanoid") and subject.Parent) or (subject and subject:IsA("BasePart") and subject.Parent) or LP.Character
+    if not char then return end
 
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
-    local part
+    local part = (CF.Target == "Head" and char:FindFirstChild("Head")) or (CF.Target == "Torso" and (char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"))) or hrp
     
-    if CF.Target == "Head" then
-        part = char:FindFirstChild("Head")
-        Cache.Offset = 0
-    elseif CF.Target == "Torso" then
-        part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
-        Cache.Offset = 1.5
-    else
-        part = hrp
-        Cache.Offset = 1.5
-    end
-
+    Cache.Offset = (CF.Target == "Head") and 0 or 1.5
     if hrp and hum and part then
-        Cache.Char, Cache.HRP, Cache.Hum, Cache.Part = char, hrp, hum, part
-        Cache.TargetMode = CF.Target
-        RayParams.FilterDescendantsInstances = {char}
-        LobotomizeCamera()
+        Cache.Hum, Cache.Part, Cache.TargetMode, Cache.Subject = hum, part, CF.Target, subject
     end
 end
 
+if getgenv().RigidConn then Disconnect(getgenv().RigidConn) end
 getgenv().RigidConn = RunService.PreRender:Connect(function()
     if not CF.Enabled then return end
-    
-    -- Check if cache is valid
-    if Cache.Char ~= LP.Character or Cache.TargetMode ~= CF.Target then
-        updateCache()
-    end
+    if Cache.Subject ~= Cam.CameraSubject or Cache.TargetMode ~= CF.Target then updateCache() end
+    if not Cache.Part then return end
+    if Cache.Hum.CameraOffset ~= V3_zero then Cache.Hum.CameraOffset = V3_zero end
 
-    local part = Cache.Part
-    if not part then return end
-
-    -- Minimal work inside loop
-    if Cache.Hum.CameraOffset ~= V3_zero then
-        Cache.Hum.CameraOffset = V3_zero
-    end
-
-    local pos = part.Position
-    local targetPos = V3_new(pos.X, pos.Y + Cache.Offset, pos.Z)
-
-    -- Handle Shift Lock Offset
+    local targetPos = Cache.Part.Position + V3_new(0, Cache.Offset, 0)
     if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
         targetPos = targetPos + (CF_angles(0, radX, 0) * V3_new(1.75, 0, 0))
     end
 
-    -- Rotation calculation
     local rotation = CF_fromEuler(radY, radX, 0)
-    local rawOffset = rotation * V3_new(0, 0, Zoom)
+    RayParams.FilterDescendantsInstances = getIgnoredInstances()
+    
+    local hit = workspace:Raycast(targetPos, rotation * V3_new(0, 0, Zoom), RayParams)
+    local finalZoom = Zoom
+    if hit and hit.Instance.CanCollide and hit.Instance.Transparency < 0.9 then
+        finalZoom = math_max(hit.Distance - 0.3, 0.5)
+    end
 
-    -- Collision
-    local hit = workspace:Raycast(targetPos, rawOffset, RayParams)
-    local curZoom = hit and math_max(hit.Distance - 0.3, 0.5) or Zoom
-
-    -- Apply
     Cam.Focus = CF_new(targetPos)
-    Cam.CFrame = CF_new(targetPos) * rotation * CF_new(0, 0, curZoom)
+    Cam.CFrame = CF_new(targetPos) * rotation * CF_new(0, 0, finalZoom)
 end)
 
 --------------------------------------------------------------------------------
--- GUI Code (Maintained functionality, streamlined structure)
+-- GUI Code (Draggable again)
 --------------------------------------------------------------------------------
+if getgenv().CF_Gui then pcall(function() getgenv().CF_Gui:Destroy() end) end
 local Gui = Instance.new("ScreenGui", gethui() and gethui() or game:GetService("CoreGui"))
 getgenv().CF_Gui = Gui
 
 local F = Instance.new("Frame", Gui)
 F.Size, F.Position = UDim2.new(0, 150, 0, 130), UDim2.new(0, 10, 0.5, -55)
-F.BackgroundColor3, F.Active = Color3.new(0, 0, 0), true
+F.BackgroundColor3, F.Active, F.Draggable = Color3.new(0, 0, 0), true, true -- Active/Draggable enabled
 Instance.new("UIStroke", F).Color = Color3.new(0.3, 0.3, 0.3)
 
--- Simple Dragging
-local dragStart, startPos, dragging = nil, nil, false
-trackConn(F.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = true; dragStart = i.Position; startPos = F.Position
+-- Dragging Logic
+local dragging, dragInput, dragStart, startPos
+trackConn(F.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = F.Position
     end
 end))
-trackConn(UserInputService.InputChanged:Connect(function(i)
-    if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
-        local delta = i.Position - dragStart
+trackConn(UserInputService.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
         F.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 end))
-trackConn(UserInputService.InputEnded:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+trackConn(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 end))
 
 local buttons = {}
-local function updateUI()
+getgenv().UpdateCFUI = function()
     buttons.Head.TextColor3 = CF.Target == "Head" and Color3.new(1,1,1) or Color3.new(0.3,0.3,0.3)
     buttons.Torso.TextColor3 = CF.Target == "Torso" and Color3.new(1,1,1) or Color3.new(0.3,0.3,0.3)
     buttons.HRP.TextColor3 = CF.Target == "HumanoidRootPart" and Color3.new(1,1,1) or Color3.new(0.3,0.3,0.3)
     buttons.Toggle.Text = CF.Enabled and "STATUS: RIGID" or "STATUS: OFF"
     buttons.Toggle.TextColor3 = CF.Enabled and Color3.new(0,1,0) or Color3.new(1,0,0)
+    buttons.Bind.Text = "BIND: " .. CF.Keybind.Name
 end
 
 local function mk(id, txt, pos, target)
     local b = Instance.new("TextButton", F)
-    b.Size, b.Position, b.Text = UDim2.new(1, -16, 0, 20), pos, txt
+    b.Size, b.Position, b.Text = UDim2.new(1, -16, 0, 18), pos, txt
     b.BackgroundColor3, b.Font, b.TextSize = Color3.new(0.05, 0.05, 0.05), Enum.Font.Code, 10
     b.TextColor3, b.BorderSizePixel = Color3.new(0.6, 0.6, 0.6), 0
     b.MouseButton1Click:Connect(function()
-        if target then CF.Target = target else CF.Enabled = not CF.Enabled end
-        updateUI()
+        if id == "Bind" then
+            b.Text = "..."
+            local l; l = UserInputService.InputBegan:Connect(function(i)
+                if i.UserInputType == Enum.UserInputType.Keyboard then
+                    CF.Keybind = i.KeyCode
+                    l:Disconnect()
+                    getgenv().UpdateCFUI()
+                end
+            end)
+        elseif target then CF.Target = target 
+        else CF.Enabled = not CF.Enabled; ToggleCameraLobotomy(CF.Enabled) end
+        getgenv().UpdateCFUI()
     end)
     buttons[id] = b
 end
 
 mk("Head", "FOLLOW: HEAD", UDim2.new(0, 8, 0, 8), "Head")
-mk("Torso", "FOLLOW: TORSO", UDim2.new(0, 8, 0, 33), "Torso")
-mk("HRP", "FOLLOW: HRP", UDim2.new(0, 8, 0, 58), "HumanoidRootPart")
-mk("Toggle", "STATUS: RIGID", UDim2.new(0, 8, 0, 83))
-updateUI()
+mk("Torso", "FOLLOW: TORSO", UDim2.new(0, 8, 0, 28), "Torso")
+mk("HRP", "FOLLOW: HRP", UDim2.new(0, 8, 0, 48), "HumanoidRootPart")
+mk("Toggle", "STATUS: RIGID", UDim2.new(0, 8, 0, 75))
+mk("Bind", "BIND: Z", UDim2.new(0, 8, 0, 95))
+getgenv().UpdateCFUI()
