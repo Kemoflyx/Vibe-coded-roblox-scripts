@@ -21,6 +21,8 @@ local ARCH_WIDTH_MAX   = 14
 local ARCH_OVERSHOOT   = 4
 local W_SIDE_OFFSET    = 4.5
 local W_FORWARD_OFFSET = 1
+local LOCK_AIM_RADIUS  = 500
+local C_LOCK_AIM_RADIUS = 100 
 
 -- Camera lock timing (seconds)
 local CAM_LOCK_DURATION = 0.55
@@ -28,41 +30,38 @@ local CAM_LOCK_DURATION = 0.55
 -- ---------------------------
 -- Camera POSITION tunables
 -- ---------------------------
--- These change the camera's anchored position during the lock (NOT the aim).
--- All values are in studs except screen offsets which are pixels.
-local CAM_POS_UP_OFFSET       = 1.50    -- additional vertical offset added to camera anchor (studs)
-local CAM_POS_RIGHT_OFFSET    = 2.1   -- world-space right offset relative to target direction (studs)
-local CAM_POS_LEFT_OFFSET     = 0      -- alternative left offset (studs); net right = right - left
-local CAM_POS_FORWARD_OFFSET  = 0      -- push camera anchor toward the target (studs)
-local CAM_POS_BACK_OFFSET     = 0      -- push camera anchor away from the target (studs); net forward = forward - back
+local CAM_POS_UP_OFFSET       = 1.4    
+local CAM_POS_RIGHT_OFFSET    = 1.1  
+local CAM_POS_LEFT_OFFSET     = 0      
+local CAM_POS_FORWARD_OFFSET  = 0      
+local CAM_POS_BACK_OFFSET     = 0      
 
--- Optional small screen-space nudge applied to aiming selection only (keeps target selection behavior tunable)
-local CAM_AIM_SCREEN_RIGHT    = 0      -- screen pixels; positive nudges aim selection right
-local CAM_AIM_SCREEN_UP       = 0      -- screen pixels; positive nudges aim selection down (screen Y increases downward)
+local CAM_AIM_SCREEN_RIGHT    = 0      
+local CAM_AIM_SCREEN_UP       = 0      
 
--- Vertical focus calculation tunables (used to compute base camera anchor height)
-local CAM_FOCUS_MULTIPLIER    = 0.25   -- scales camera Y gap between camera and root
-local CAM_FOCUS_MIN           = 0    -- min vertical focus offset (studs)
-local CAM_FOCUS_MAX           = 0    -- max vertical focus offset (studs)
+local CAM_FOCUS_MULTIPLIER    = 0.25   
+local CAM_FOCUS_MIN           = 0    
+local CAM_FOCUS_MAX           = 0    
 
--- Legacy/world-space shiftlock nudge applied to facing (kept for compatibility)
-local CAM_OFFSET_RIGHT        = 2.25   -- additional right nudge applied to facing vector (studs)
+local CAM_OFFSET_RIGHT        = 1.5   
 
--- Targeting options
-local CAM_USE_CENTER_AIM      = true   -- true = aim uses camera center; false = use mouse
+local CAM_USE_CENTER_AIM      = false   -- Forced false: always use cursor
 
 local QD_RANGE        = 10
 local QD_FACE_LINGER  = 0.5
 local RAG_WATCH_WINDOW = 0.075
 local RAG_WATCH_Q_DELAY = 0.005
-local RLOCK_LERP_MIN  = 50
-local RLOCK_LERP_MAX  = 50
-local RLOCK_LERP_VEL  = 0.5
+
+-- LERP TUNING (Buttery smooth and responsive tracking, scales dynamically)
+local RLOCK_LERP_MIN  = 45     -- Smooth tracking for slower movements
+local RLOCK_LERP_MAX  = 45     -- Snappy, fast tracking when the target dashes
+local RLOCK_LERP_VEL  = 1
+
 local ARC_REBUILD_THRESHOLD = 0.5
 local VEL_SMOOTH_FACTOR = 0.15
 local POS_SMOOTH_FACTOR = 0.35
 local W_FACE_LERP       = 0.0001
-local RLOCK_PRED_TIME   = 0.10
+local RLOCK_PRED_TIME   = 0.10   -- Restored back to 0.10 seconds (100ms)
 local QD_SIDE_TO_Q     = 0.02
 local QD_Q_TO_3       = 0.00
 local QD_SK_RELEASE   = 0.05
@@ -258,26 +257,45 @@ end
 local function press(key)   VIM:SendKeyEvent(true,  key, false, game) end
 local function release(key) VIM:SendKeyEvent(false, key, false, game) end
 
--- getTarget supports optional camera-center aiming and small screen nudges for selection only
-local function getTarget(root, range)
-    local aimScreen
-    if CAM_USE_CENTER_AIM then
-        local vs = camera and camera.ViewportSize or Vector2.new(1920, 1080)
-        aimScreen = Vector2.new(vs.X * 0.5 + CAM_AIM_SCREEN_RIGHT, vs.Y * 0.5 + CAM_AIM_SCREEN_UP)
-    else
-        aimScreen = UIS:GetMouseLocation()
-    end
+-- HIGHLY ACCURATE SELECTOR: Locks strictly within 15px of cursor, fallbacks to Head, prioritizes closest character distance
+-- HIGHLY ACCURATE SELECTOR: Locks strictly within cursor radius, fallbacks to Head, prioritizes closest character distance
+local function getTarget(root, range, customRadius)
+    local currentCamera = workspace.CurrentCamera
+    if not currentCamera then return nil end
 
-    local closest, closestDist = nil, math.huge
+    -- Determine which radius to use (defaults to the E dash radius if not provided)
+    local activeRadius = customRadius or LOCK_AIM_RADIUS
+
+    -- ALWAYS use the cursor location for aiming
+    local aimScreen = UIS:GetMouseLocation()
+
+    local closest, closestWorldDist = nil, math.huge
     for model, data in pairs(targetCache) do
         if model.Parent and data.Humanoid.Health > 0 then
             local dist = (data.Root.Position - root.Position).Magnitude
             if dist <= range then
-                local screenPos = workspace.CurrentCamera:WorldToScreenPoint(data.Root.Position)
-                local sd = (Vector2.new(screenPos.X, screenPos.Y) - aimScreen).Magnitude
-                if sd < closestDist then
-                    closestDist = sd
-                    closest = data.Root
+                local targetPos = data.Root.Position
+                -- WorldToViewportPoint correctly handles 2D viewport coordinates and matches GetMouseLocation()
+                local screenPos, onScreen = currentCamera:WorldToViewportPoint(targetPos)
+                
+                -- Upwards Fallback: If target's RootPart is slightly off-screen, verify their Head!
+                if (not onScreen or screenPos.Z <= 0) and model:FindFirstChild("Head") then
+                    targetPos = model.Head.Position
+                    screenPos, onScreen = currentCamera:WorldToViewportPoint(targetPos)
+                end
+
+                -- Verify they are actually on screen and in front of the lens
+                if onScreen and screenPos.Z > 0 then
+                    local sd = (Vector2.new(screenPos.X, screenPos.Y) - aimScreen).Magnitude
+                    
+                    -- Strictly lock only if they are within our active cursor circle
+                    if sd <= activeRadius then
+                        -- Prioritize the one closest in world distance (studs) to our character
+                        if dist < closestWorldDist then
+                            closestWorldDist = dist
+                            closest = data.Root
+                        end
+                    end
                 end
             end
         else
@@ -287,15 +305,104 @@ local function getTarget(root, range)
     return closest
 end
 
-local function applyFacing(root, hum, targetRoot)
+-- HELPER: Accurately checks the physical properties of the game to see if vertical aim is allowed.
+-- Upgraded to check active combat animation priorities to prevent getting stuck on leaked BodyGyros.
+local function checkVerticalAim(root, hum)
+    if not root or not hum then return false end
+    
+    -- Detect if a custom skill/combat animation is playing. 
+    -- Roblox default animations are Core or Idle; moves always use Action priority.
+    local isCombatActive = false
+    local playingTracks = hum:GetPlayingAnimationTracks()
+    for _, track in ipairs(playingTracks) do
+        local priority = track.Priority
+        if priority == Enum.AnimationPriority.Action 
+           or priority == Enum.AnimationPriority.Action2 
+           or priority == Enum.AnimationPriority.Action3 
+           or priority == Enum.AnimationPriority.Action4 then
+            isCombatActive = true
+            break
+        end
+    end
+    
+    local st = hum:GetState()
+    local isNativelyAerial = (st == Enum.HumanoidStateType.Flying or st == Enum.HumanoidStateType.Swimming)
+    
+    -- If no combat animation is playing, and they aren't natively flying/swimming,
+    -- then any BodyGyro left behind is just a ghost/abandoned gyro. Force horizontal!
+    if not isCombatActive and not isNativelyAerial then
+        return false
+    end
+    
+    -- If combat is active or they are natively flying/swimming, check physical rules
+    if root.Anchored or hum.PlatformStand or isNativelyAerial then 
+        return true 
+    end
+    
+    for _, v in ipairs(root:GetChildren()) do
+        if v:IsA("BodyGyro") then
+            if v.MaxTorque.X > 1000 then return true end
+        elseif v:IsA("AlignOrientation") then
+            if v.AlignType ~= Enum.AlignType.PrimaryAxisParallel and v.MaxTorque > 1000 then 
+                return true 
+            end
+        end
+    end
+    
+    return false
+end
+
+-- State-preserving smoothed tracking for Dashes (Immune to Camera Jitter/Drag)
+local function applyFacing(root, hum, targetRoot, dt, currentSmoothDir)
     if hum then hum.AutoRotate = false end
     local myPos    = root.Position
-    local smoothed = getSmoothedPos(targetRoot)
-    local dir      = Vector3.new(smoothed.X - myPos.X, 0, smoothed.Z - myPos.Z)
+    
+    -- Dash facing now uses the EXACT SAME prediction as C-Lock
+    local _rld = rootToData[targetRoot]
+    local predPos = targetRoot.Position + (_rld and Vector3.new(_rld.velocity.X, 0, _rld.velocity.Z) * RLOCK_PRED_TIME or Vector3.zero)
+    
+    local canAimVertically = checkVerticalAim(root, hum)
+    local targetY = canAimVertically and predPos.Y or myPos.Y
+    
+    local dir = Vector3.new(predPos.X - myPos.X, targetY - myPos.Y, predPos.Z - myPos.Z)
     if dir.Magnitude > 0.01 then
-        local lookCFrame = CFrame.lookAt(myPos, myPos + dir)
-        root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
+        dir = dir.Unit
+        local baseDir = currentSmoothDir or root.CFrame.LookVector
+        
+        -- Use dynamic speed matching the C-Lock setting (20-45 scale)
+        local spd = _rld and _rld.velocity.Magnitude or 0
+        local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
+        
+        local newSmoothDir = baseDir:Lerp(dir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
+        
+        -- CRITICAL FIX: Normalize newly calculated smooth direction to prevent magnitude decay!
+        if newSmoothDir.Magnitude > 0.001 then
+            newSmoothDir = newSmoothDir.Unit
+        end
+        
+        -- Flatten post-lerp just to be 100% safe if horizontal
+        if not canAimVertically then
+            newSmoothDir = Vector3.new(newSmoothDir.X, 0, newSmoothDir.Z)
+            if newSmoothDir.Magnitude > 0.01 then newSmoothDir = newSmoothDir.Unit end
+        end
+
+        if newSmoothDir.Magnitude > 0.01 then
+            local lookCFrame = CFrame.lookAt(myPos, myPos + newSmoothDir)
+            local targetCFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
+            
+            root.CFrame = targetCFrame
+            
+            for _, v in ipairs(root:GetChildren()) do
+                if v:IsA("BodyGyro") then
+                    v.CFrame = targetCFrame
+                elseif v:IsA("AlignOrientation") and v.Mode == Enum.OrientationAlignmentMode.OneAttachment then
+                    v.CFrame = targetCFrame
+                end
+            end
+        end
+        return newSmoothDir
     end
+    return currentSmoothDir
 end
 
 local keysHeld = {}
@@ -335,6 +442,7 @@ local function startRLock(target)
     hl.Parent            = target.Parent
     rHighlight = hl
     local smoothDir = nil
+    
     rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
         if rLockPaused then return end
         if isRagdolled() then stopRLock() return end
@@ -344,21 +452,59 @@ local function startRLock(target)
         if not r then return end
         if not rLockTarget or not rLockTarget.Parent then stopRLock() return end
         local h = c:FindFirstChildOfClass("Humanoid")
+        
+        local canAimVertically = checkVerticalAim(r, h)
+        
         if h then h.AutoRotate = false end
         local myPos   = r.Position
         local _rld = rootToData[rLockTarget]
         local predPos = rLockTarget.Position + (_rld and Vector3.new(_rld.velocity.X, 0, _rld.velocity.Z) * RLOCK_PRED_TIME or Vector3.zero)
-        local rawDir  = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
+        
+        -- Apply Y targeting ONLY when the game naturally allows it.
+        local targetY = canAimVertically and predPos.Y or myPos.Y
+        local rawDir  = Vector3.new(predPos.X - myPos.X, targetY - myPos.Y, predPos.Z - myPos.Z)
+        
         if rawDir.Magnitude > 0.01 then
             rawDir = rawDir.Unit
+            
+            -- Keep prediction perfectly horizontal if vertical aiming is restricted
+            if not canAimVertically then
+                rawDir = Vector3.new(rawDir.X, 0, rawDir.Z).Unit
+            end
+            
             local _tData = rootToData[rLockTarget]
             local spd = _tData and _tData.velocity.Magnitude or 0
             local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
             if not smoothDir then smoothDir = rawDir end
+            
+            -- Smooth tracking with dynamic velocity scaling
             smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
+            
+            -- CRITICAL FIX: Normalize smoothDir to prevent magnitude decay, enabling actual lerp speed control!
+            if smoothDir.Magnitude > 0.001 then
+                smoothDir = smoothDir.Unit
+            end
+            
+            -- Enforce strict horizontal aim post-lerp
+            if not canAimVertically then
+                smoothDir = Vector3.new(smoothDir.X, 0, smoothDir.Z)
+                if smoothDir.Magnitude > 0.01 then smoothDir = smoothDir.Unit end
+            end
+            
             if smoothDir.Magnitude > 0.01 then
                 local lc = CFrame.lookAt(myPos, myPos + smoothDir)
-                r.CFrame = CFrame.new(myPos) * (lc - lc.Position)
+                local targetCFrame = CFrame.new(myPos) * (lc - lc.Position)
+                
+                r.CFrame = targetCFrame
+                
+                -- SILENCE PHYSICS ENGINE TUG-OF-WAR
+                for _, v in ipairs(r:GetChildren()) do
+                    if v:IsA("BodyGyro") then
+                        v.CFrame = targetCFrame
+                    elseif v:IsA("AlignOrientation") and v.Mode == Enum.OrientationAlignmentMode.OneAttachment then
+                        v.CFrame = targetCFrame
+                    end
+                end
             end
         end
     end))
@@ -379,17 +525,14 @@ trackActive(RunService.Heartbeat:Connect(function()
     wasRagdolled = false
 end))
 
--- Camera Lock (applies POSITION offsets to camera anchor; aim facing still uses CAM_OFFSET_RIGHT)
 local function startCameraLock(root, target)
     local startTime = tick()
     local unlocked  = false
     local stepName  = "__dashCamLock__"
 
-    -- Derive a vertical focus offset from the root at lock start.
     local rawYGap    = camera.CFrame.Position.Y - root.Position.Y
     local focusOffY  = math.clamp(rawYGap * CAM_FOCUS_MULTIPLIER, CAM_FOCUS_MIN, CAM_FOCUS_MAX) + CAM_POS_UP_OFFSET
 
-    -- Compute net horizontal offsets (right - left, forward - back)
     local netRightOffset = CAM_POS_RIGHT_OFFSET - CAM_POS_LEFT_OFFSET
     local netForwardOffset = CAM_POS_FORWARD_OFFSET - CAM_POS_BACK_OFFSET
 
@@ -403,7 +546,6 @@ local function startCameraLock(root, target)
         if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
         local curCF = camera.CFrame
 
-        -- Snapshot pitch DYNAMICALLY during the lock so the player can continue looking up/down
         local lv   = curCF.LookVector
         local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
         local pitchRad = math.clamp(
@@ -411,13 +553,10 @@ local function startCameraLock(root, target)
             -1.2, 0.5
         )
 
-        -- Build a lag-free anchor from root.Position and apply POSITION offsets (this moves the camera anchor).
         local baseFocusPos = root.Position + Vector3.new(0, focusOffY, 0)
 
-        -- Determine horizontal direction toward target for relative offsets
         local toH = Vector3.new(target.Position.X - baseFocusPos.X, 0, target.Position.Z - baseFocusPos.Z)
         if toH.Magnitude <= 0.01 then
-            -- fallback: just set camera to look at target from baseFocusPos without offsets
             local facingCF = CFrame.lookAt(baseFocusPos, target.Position)
             local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
             local zoomDist = math.max((curCF.Position - baseFocusPos).Magnitude, 0.5)
@@ -429,28 +568,23 @@ local function startCameraLock(root, target)
         local forwardDir = toH.Unit
         local rightDir = Vector3.new(-toH.Z, 0, toH.X).Unit
 
-        -- Apply POSITION offsets to the focus anchor (these move where the camera is anchored)
         local focusPos = baseFocusPos
             + rightDir * netRightOffset
             + forwardDir * netForwardOffset
 
-        -- After moving the anchor, compute facing vector (optionally apply CAM_OFFSET_RIGHT to facing only)
         local toH2 = Vector3.new(target.Position.X - focusPos.X, 0, target.Position.Z - focusPos.Z)
         if toH2.Magnitude > 0.01 then
-            -- Apply facing nudge (legacy shiftlock feel) to the facing vector only (does NOT move anchor)
             if CAM_OFFSET_RIGHT ~= 0 then
                 local rightDir2 = Vector3.new(-toH2.Z, 0, toH2.X).Unit
                 toH2 = toH2 + rightDir2 * CAM_OFFSET_RIGHT
             end
 
-            -- Build full rotation: horizontal yaw toward target + live pitch from user
             local facingCF = CFrame.lookAt(focusPos, focusPos + toH2)
             local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
 
-            -- Step back from focusPos along the full look vector using current zoom distance
             local zoomDist = math.max((curCF.Position - focusPos).Magnitude, 0.5)
             local correctCamPos = focusPos - rotCF.LookVector * zoomDist
-            camera.CFrame = rotCF + (correctCamPos - focusPos)
+            camera.CFrame = rotCF + (correctCamPos - baseFocusPos)
         end
     end)
 
@@ -512,15 +646,16 @@ local function activate()
         if not target then return end
         local hum = char:FindFirstChildOfClass("Humanoid")
         local startTime = tick()
+        local sFaceDir = nil
         local conn
-        conn = trackActive(RunService.PreRender:Connect(function()
+        conn = trackActive(RunService.PreRender:Connect(function(dt)
             if isRagdolled() then conn:Disconnect() if hum then hum.AutoRotate = true end return end
             if tick() - startTime >= FACING_LINGER then
                 conn:Disconnect()
                 if hum then hum.AutoRotate = true end
                 return
             end
-            applyFacing(root, hum, target)
+            sFaceDir = applyFacing(root, hum, target, dt, sFaceDir)
         end))
         local unlockCam = startCameraLock(root, target)
         return
@@ -575,7 +710,7 @@ local function activate()
             if traveled >= totalLen then
                 connection:Disconnect()
                 local lingerStart = tick()
-                local currentDir  = root.CFrame.LookVector
+                local lingerFaceDir = nil
                 local lingerConn
                 lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
                     if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
@@ -586,13 +721,7 @@ local function activate()
                         rLockPaused = false
                         return
                     end
-                    local myPos = root.Position
-                    local dir2  = Vector3.new(target.Position.X - myPos.X, 0, target.Position.Z - myPos.Z)
-                    if dir2.Magnitude > 0.01 then
-                        currentDir = currentDir:Lerp(dir2.Unit, 1 - (W_FACE_LERP ^ ldt))
-                        local lookCFrame = CFrame.lookAt(myPos, myPos + currentDir)
-                        root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
-                    end
+                    lingerFaceDir = applyFacing(root, hum, target, ldt, lingerFaceDir)
                 end))
                 local unlockCam = startCameraLock(root, target)
                 return
@@ -615,9 +744,9 @@ local function activate()
         local arcTable, totalLen = buildArcTable(startPos, initMid, initFinal)
 
         local facingConn
-        facingConn = trackActive(RunService.PreRender:Connect(function()
+        facingConn = trackActive(RunService.PreRender:Connect(function(dt)
             if isRagdolled() then facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
-            applyFacing(root, hum, target)
+            archFaceDir = applyFacing(root, hum, target, dt, archFaceDir)
         end))
         local unlockCam = startCameraLock(root, target)
         local yVel = 0
@@ -645,8 +774,9 @@ local function activate()
                 unlockCam()
                 unlockCam = startCameraLock(root, target)
                 local lingerStart = tick()
+                local archLingerDir = nil
                 local lingerConn
-                lingerConn = trackActive(RunService.PreRender:Connect(function()
+                lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
                     if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end return end
                     if hum then hum.AutoRotate = false end
                     if tick() - lingerStart >= FACING_LINGER then
@@ -654,7 +784,7 @@ local function activate()
                         if hum then hum.AutoRotate = true end
                         return
                     end
-                    applyFacing(root, hum, target)
+                    archLingerDir = applyFacing(root, hum, target, ldt, archLingerDir)
                 end))
                 return
             end
@@ -709,8 +839,9 @@ local function quickDash()
 
     startCameraLock(root, target)
     local startTime = tick()
+    local qdFaceDir = nil
     local conn
-    conn = trackActive(RunService.PreRender:Connect(function()
+    conn = trackActive(RunService.PreRender:Connect(function(dt)
         if isRagdolled() then
             conn:Disconnect()
             if hum then hum.AutoRotate = true end
@@ -721,7 +852,7 @@ local function quickDash()
             if hum then hum.AutoRotate = true end
             return
         end
-        applyFacing(root, hum, target)
+        qdFaceDir = applyFacing(root, hum, target, dt, qdFaceDir)
     end))
 end
 
@@ -740,7 +871,8 @@ local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
             local char = getCharacter()
             local root = char and char:FindFirstChild("HumanoidRootPart")
             if root then
-                local target = getTarget(root, math.huge)
+                -- Pass the new C_LOCK_AIM_RADIUS here so it doesn't use the E Dash default of 50
+                local target = getTarget(root, math.huge, C_LOCK_AIM_RADIUS)
                 if target then startRLock(target) end
             end
         end
