@@ -29,7 +29,7 @@ local RAG_WATCH_WINDOW = 0.075  -- ragdoll check window after Q fires (seconds)
 local RAG_WATCH_Q_DELAY = 0.005 -- extra wait after Q before starting ragdoll check
 local RLOCK_LERP_MIN  = 50     -- C lock min facing lerp speed (standing still)
 local RLOCK_LERP_MAX  = 50     -- C lock max facing lerp speed (running)
-local RLOCK_LERP_VEL  = 0.5    -- velocity multiplier for C lock lerp speed
+local RLOCK_LERP_VEL  = 1    -- velocity multiplier for C lock lerp speed
 local ARC_REBUILD_THRESHOLD = 0.5 -- studs target must move before arc rebuilds
 local VEL_SMOOTH_FACTOR = 0.15   -- velocity smoothing factor for target tracking (lower = smoother)
 local POS_SMOOTH_FACTOR = 0.35   -- position smoothing factor for target tracking (lower = smoother)
