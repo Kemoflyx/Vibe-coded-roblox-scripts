@@ -53,8 +53,8 @@ local RAG_WATCH_WINDOW = 0.075
 local RAG_WATCH_Q_DELAY = 0.005
 
 -- LERP TUNING (Buttery smooth and responsive tracking, scales dynamically)
-local RLOCK_LERP_MIN  = 45     -- Smooth tracking for slower movements
-local RLOCK_LERP_MAX  = 45     -- Snappy, fast tracking when the target dashes
+local RLOCK_LERP_MIN  = 50     -- Smooth tracking for slower movements
+local RLOCK_LERP_MAX  = 50     -- Snappy, fast tracking when the target dashes
 local RLOCK_LERP_VEL  = 1
 
 local ARC_REBUILD_THRESHOLD = 0.5
