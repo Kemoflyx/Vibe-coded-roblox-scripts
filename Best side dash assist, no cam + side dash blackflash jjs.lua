@@ -371,6 +371,7 @@ local function startRLock(target)
 	hl.FillColor         = Color3.fromRGB(255, 255, 255)
 	hl.OutlineColor      = Color3.fromRGB(255, 255, 255)
 	hl.FillTransparency  = 0.75
+	hl.OutlineTransparency = 0.4
 	hl.Parent            = target.Parent
 	rHighlight = hl
 	local smoothDir = nil  -- smoothed facing direction, velocity-weighted lerp
