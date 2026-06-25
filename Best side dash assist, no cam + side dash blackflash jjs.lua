@@ -56,6 +56,28 @@ getgenv().__dashCleanup = function()
 	getgenv().__dashCleanup = nil
 end
 
+-- OPTIMIZATION: Cache local player references so findFirstChild isn't spammed at 144+ FPS
+local myChar = nil
+local myRoot = nil
+local myHum  = nil
+
+local function updateLocalChar(char)
+    myChar = char
+    myRoot = char and char:WaitForChild("HumanoidRootPart", 5)
+    myHum  = char and char:FindFirstChildOfClass("Humanoid")
+end
+
+if player.Character then
+    updateLocalChar(player.Character)
+end
+
+local charAddedConn = player.CharacterAdded:Connect(updateLocalChar)
+local charRemovingConn = player.CharacterRemoving:Connect(function()
+    myChar, myRoot, myHum = nil, nil, nil
+end)
+onCleanup(function() charAddedConn:Disconnect() end)
+onCleanup(function() charRemovingConn:Disconnect() end)
+
 local targetCache = {}
 local rootToData  = {}  -- reverse map: HRP -> data, O(1) lookup
 local playerConns = {}
@@ -153,7 +175,7 @@ end)
 
 -- Periodic rescan: catches anyone missed due to timing (every 3 seconds)
 trackActive(RunService.Heartbeat:Connect(function()
-	local now = tick()
+	local now = os.clock()
 	if not getgenv().__lastRescan or now - getgenv().__lastRescan < 3 then return end
 	getgenv().__lastRescan = now
 	for p in pairs(playerConns) do
@@ -162,7 +184,7 @@ trackActive(RunService.Heartbeat:Connect(function()
 		end
 	end
 end))
-getgenv().__lastRescan = tick()
+getgenv().__lastRescan = os.clock()
 
 local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 	if dt <= 0 then return end
@@ -192,12 +214,8 @@ local function getSmoothedPos(targetRoot)
 end
 
 local function isRagdolled()
-	local char = player.Character
-	if not char then return true end
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if not hrp or not hum then return true end
-	return hum:GetState() == Enum.HumanoidStateType.Physics
+	if not myChar or not myRoot or not myHum then return true end
+	return myHum:GetState() == Enum.HumanoidStateType.Physics
 end
 
 local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
@@ -254,6 +272,63 @@ local function getTarget(root, range)
 	return closest
 end
 
+-- PERFORMANCE OPTIMIZATION: Caches vertical checking calculations every 0.05s to protect rendering frames
+local lastVertCheck = 0
+local cachedVertResult = false
+
+local function checkVerticalAim(root, hum)
+    if not root or not hum then return false end
+    
+    local now = os.clock()
+    if now - lastVertCheck < 0.05 then
+        return cachedVertResult
+    end
+    lastVertCheck = now
+    
+    local isCombatActive = false
+    local playingTracks = hum:GetPlayingAnimationTracks()
+    for _, track in ipairs(playingTracks) do
+        local priority = track.Priority
+        if priority == Enum.AnimationPriority.Action 
+           or priority == Enum.AnimationPriority.Action2 
+           or priority == Enum.AnimationPriority.Action3 
+           or priority == Enum.AnimationPriority.Action4 then
+            isCombatActive = true
+            break
+        end
+    end
+    
+    local st = hum:GetState()
+    local isNativelyAerial = (st == Enum.HumanoidStateType.Flying or st == Enum.HumanoidStateType.Swimming)
+    
+    if not isCombatActive and not isNativelyAerial then
+        cachedVertResult = false
+        return false
+    end
+    
+    if root.Anchored or hum.PlatformStand or isNativelyAerial then 
+        cachedVertResult = true
+        return true 
+    end
+    
+    for _, v in ipairs(root:GetChildren()) do
+        if v:IsA("BodyGyro") then
+            if v.MaxTorque.X > 1000 then 
+                cachedVertResult = true
+                return true 
+            end
+        elseif v:IsA("AlignOrientation") then
+            if v.AlignType ~= Enum.AlignType.PrimaryAxisParallel and v.MaxTorque > 1000 then 
+                cachedVertResult = true
+                return true 
+            end
+        end
+    end
+    
+    cachedVertResult = false
+    return false
+end
+
 local function applyFacing(root, hum, targetRoot)
 	if hum then hum.AutoRotate = false end
 	local myPos    = root.Position
@@ -277,9 +352,7 @@ local lastRLockTarget = nil  -- remembers target for auto-relock
 -- Register stopRLock to run on re-execution
 onCleanup(function()
 	if rHighlight then rHighlight:Destroy() rHighlight = nil end
-	local c = player.Character
-	local h = c and c:FindFirstChildOfClass("Humanoid")
-	if h then h.AutoRotate = true end
+	if myHum then myHum.AutoRotate = true end
 end)
 
 local function stopRLock()
@@ -287,9 +360,7 @@ local function stopRLock()
 	rLockTarget = nil
 	if rLockConn then rLockConn:Disconnect() rLockConn = nil end
 	if rHighlight then rHighlight:Destroy() rHighlight = nil end
-	local c = player.Character
-	local h = c and c:FindFirstChildOfClass("Humanoid")
-	if h then h.AutoRotate = true end
+	if myHum then myHum.AutoRotate = true end
 end
 
 local function startRLock(target)
@@ -303,38 +374,70 @@ local function startRLock(target)
 	hl.Parent            = target.Parent
 	rHighlight = hl
 	local smoothDir = nil  -- smoothed facing direction, velocity-weighted lerp
-	rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
+	
+    rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
 		if rLockPaused then return end
 		if isRagdolled() then stopRLock() return end
-		local c = player.Character
-		if not c then return end
-		local r = c:FindFirstChild("HumanoidRootPart")
-		if not r then return end
+		if not myChar or not myRoot or not myHum then return end
 		if not rLockTarget or not rLockTarget.Parent then stopRLock() return end
-		local h = c:FindFirstChildOfClass("Humanoid")
-		if h then h.AutoRotate = false end
-		local myPos   = r.Position
+        
+        -- MATH 1: Added checkVerticalAim functionality back in
+		local canAimVertically = checkVerticalAim(myRoot, myHum)
+        myHum.AutoRotate = false
+        
+		local myPos   = myRoot.Position
 		local _rld = rootToData[rLockTarget]
 		local predPos = rLockTarget.Position + (_rld and Vector3.new(_rld.velocity.X, 0, _rld.velocity.Z) * RLOCK_PRED_TIME or Vector3.zero)
-		local rawDir  = Vector3.new(predPos.X - myPos.X, 0, predPos.Z - myPos.Z)
-		if rawDir.Magnitude > 0.01 then
+		
+        -- Apply Y targeting ONLY when the game naturally allows it.
+        local targetY = canAimVertically and predPos.Y or myPos.Y
+		local rawDir  = Vector3.new(predPos.X - myPos.X, targetY - myPos.Y, predPos.Z - myPos.Z)
+		
+        if rawDir.Magnitude > 0.01 then
 			rawDir = rawDir.Unit
+            
+            -- Keep prediction perfectly horizontal if vertical aiming is restricted
+            if not canAimVertically then
+                rawDir = Vector3.new(rawDir.X, 0, rawDir.Z).Unit
+            end
+            
 			-- Velocity-based lerp speed: faster lerp when target moves fast, min 8 max 20
 			local _tData = rootToData[rLockTarget]
 			local spd = _tData and _tData.velocity.Magnitude or 0
 			local lerpSpeed = math.clamp(RLOCK_LERP_MIN + spd * RLOCK_LERP_VEL, RLOCK_LERP_MIN, RLOCK_LERP_MAX)
 			if not smoothDir then smoothDir = rawDir end
-			smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
+			
+            smoothDir = smoothDir:Lerp(rawDir, 1 - math.exp(-lerpSpeed * (dt or 1/60)))
+            
+            -- Normalize newly calculated smooth direction to prevent magnitude decay
+            if smoothDir.Magnitude > 0.001 then
+                smoothDir = smoothDir.Unit
+            end
+            
+            -- Enforce strict horizontal aim post-lerp
+            if not canAimVertically then
+                smoothDir = Vector3.new(smoothDir.X, 0, smoothDir.Z)
+                if smoothDir.Magnitude > 0.01 then smoothDir = smoothDir.Unit end
+            end
+            
 			if smoothDir.Magnitude > 0.01 then
 				local lc = CFrame.lookAt(myPos, myPos + smoothDir)
-				r.CFrame = CFrame.new(myPos) * (lc - lc.Position)
+                local targetCFrame = CFrame.new(myPos) * (lc - lc.Position)
+                
+				myRoot.CFrame = targetCFrame
+                
+                -- SILENCE PHYSICS ENGINE TUG-OF-WAR
+                for _, v in ipairs(myRoot:GetChildren()) do
+                    if v:IsA("BodyGyro") then
+                        v.CFrame = targetCFrame
+                    elseif v:IsA("AlignOrientation") and v.Mode == Enum.OrientationAlignmentMode.OneAttachment then
+                        v.CFrame = targetCFrame
+                    end
+                end
 			end
 		end
 	end))
 end
-
-
-
 
 -- Auto-relock watcher: if C lock was active and ragdoll clears, relock onto same target
 local wasRagdolled = false
@@ -356,18 +459,16 @@ end))
 local function activate()
 	local _holdW0 = keysHeld[Enum.KeyCode.W] == true
 	local _holdS0 = keysHeld[Enum.KeyCode.S] == true
-	local _char0  = player.Character
-	local _root0  = _char0 and _char0:FindFirstChild("HumanoidRootPart")
 	local _preSD  = nil
 	local _preSK  = Enum.KeyCode.D
 	local _noKeys = not _holdW0 and not _holdS0 and not keysHeld[Enum.KeyCode.A] and not keysHeld[Enum.KeyCode.D]
-	if _root0 and not _holdS0 then
+	if myRoot and not _holdS0 then
 		local _range = _holdW0 and MAX_RANGE_W or MAX_RANGE
-		local _tgt0  = getTarget(_root0, _range)
+		local _tgt0  = getTarget(myRoot, _range)
 		if not _tgt0 then return end
 		if _noKeys then
-			local _tp0 = Vector3.new(_tgt0.Position.X, _root0.Position.Y, _tgt0.Position.Z)
-			local _to0 = (_tp0 - _root0.Position)
+			local _tp0 = Vector3.new(_tgt0.Position.X, myRoot.Position.Y, _tgt0.Position.Z)
+			local _to0 = (_tp0 - myRoot.Position)
 			if _to0.Magnitude > 0.01 then
 				_to0 = _to0.Unit
 				_preSD = workspace.CurrentCamera.CFrame.RightVector:Dot(_to0) >= 0 and 1 or -1
@@ -381,7 +482,7 @@ local function activate()
 			task.delay(0.06, function() release(Enum.KeyCode.Q) end)
 		end
 	else
-		local _tgt0 = _root0 and getTarget(_root0, math.huge) or nil
+		local _tgt0 = myRoot and getTarget(myRoot, math.huge) or nil
 		if not _tgt0 then return end
 		press(Enum.KeyCode.Q)
 		task.delay(0.06, function() release(Enum.KeyCode.Q) end)
@@ -390,11 +491,11 @@ local function activate()
 	local _ragWatchFired = false
 	local _ragWatchConn
 	-- Start timing from when Q fires so ragdoll cancel has time to register
-	task.delay(QD_SIDE_TO_Q + RAG_WATCH_Q_DELAY, function() _ragWatchStart = tick() end)
+	task.delay(QD_SIDE_TO_Q + RAG_WATCH_Q_DELAY, function() _ragWatchStart = os.clock() end)
 	_ragWatchConn = trackActive(RunService.Heartbeat:Connect(function()
 		if not _ragWatchStart then return end
 		if _ragWatchFired then _ragWatchConn:Disconnect() return end
-		if tick() - _ragWatchStart > RAG_WATCH_WINDOW then _ragWatchFired = true _ragWatchConn:Disconnect() return end
+		if os.clock() - _ragWatchStart > RAG_WATCH_WINDOW then _ragWatchFired = true _ragWatchConn:Disconnect() return end
 		if isRagdolled() then return end
 		_ragWatchFired = true
 		_ragWatchConn:Disconnect()
@@ -402,37 +503,31 @@ local function activate()
 		local holdingS = _holdS0
 
 	if holdingS then
-		local char = getCharacter()
-		local root = char:FindFirstChild("HumanoidRootPart")
-		if not root then return end
-		local target = getTarget(root, math.huge)
+		if not myRoot or not myHum then return end
+		local target = getTarget(myRoot, math.huge)
 		if not target then return end
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		local startTime = tick()
+		local startTime = os.clock()
 		local conn
 		conn = trackActive(RunService.PreRender:Connect(function()
-			if isRagdolled() then conn:Disconnect() if hum then hum.AutoRotate = true end return end
-			if tick() - startTime >= FACING_LINGER then
+			if isRagdolled() then conn:Disconnect() if myHum then myHum.AutoRotate = true end return end
+			if os.clock() - startTime >= FACING_LINGER then
 				conn:Disconnect()
-				if hum then hum.AutoRotate = true end
+				if myHum then myHum.AutoRotate = true end
 				return
 			end
-			applyFacing(root, hum, target)
+			applyFacing(myRoot, myHum, target)
 		end))
 		return
 	end
 
 	if holdingW and onCooldownW then return end
 	if not holdingW and onCooldown then return end
-	local char = getCharacter()
-	local root = char:FindFirstChild("HumanoidRootPart")
-	if not root then return end
-	local target = getTarget(root, holdingW and MAX_RANGE_W or MAX_RANGE)
+	if not myRoot or not myHum then return end
+	local target = getTarget(myRoot, holdingW and MAX_RANGE_W or MAX_RANGE)
 	if not target then return end
 	if holdingW then onCooldownW = true else onCooldown = true end
-	local hum = char:FindFirstChildOfClass("Humanoid")
 
-	local startPos = root.Position
+	local startPos = myRoot.Position
 
 	local initTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
 	local initTo     = (initTarget - startPos)
@@ -448,7 +543,7 @@ local function activate()
 
 	if holdingW then
 		-- W dash: track target live each frame, always end to their right
-		if hum then hum.AutoRotate = false end
+		myHum.AutoRotate = false
 		rLockPaused = true
 
 		-- Estimate initial total length for progress tracking
@@ -457,7 +552,7 @@ local function activate()
 		local totalLen  = (initFinal - startPos).Magnitude
 
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
-			if isRagdolled() then connection:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
+			if isRagdolled() then connection:Disconnect() if myHum then myHum.AutoRotate = true end rLockPaused = false return end
 
 			-- Recompute destination only when target moves meaningfully (saves fps)
 			local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
@@ -474,24 +569,24 @@ local function activate()
 			traveled = traveled + speed * dt
 			if traveled >= totalLen then
 				connection:Disconnect()
-				local lingerStart = tick()
-				local currentDir  = root.CFrame.LookVector
+				local lingerStart = os.clock()
+				local currentDir  = myRoot.CFrame.LookVector
 				local lingerConn
 				lingerConn = trackActive(RunService.PreRender:Connect(function(ldt)
-					if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end rLockPaused = false return end
-					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= FACING_LINGER then
+					if isRagdolled() then lingerConn:Disconnect() if myHum then myHum.AutoRotate = true end rLockPaused = false return end
+					if myHum then myHum.AutoRotate = false end
+					if os.clock() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
-						if hum then hum.AutoRotate = true end
+						if myHum then myHum.AutoRotate = true end
 						rLockPaused = false
 						return
 					end
-					local myPos = root.Position
+					local myPos = myRoot.Position
 					local dir2  = Vector3.new(target.Position.X - myPos.X, 0, target.Position.Z - myPos.Z)
 					if dir2.Magnitude > 0.01 then
 						currentDir = currentDir:Lerp(dir2.Unit, 1 - (W_FACE_LERP ^ ldt))
 						local lookCFrame = CFrame.lookAt(myPos, myPos + currentDir)
-						root.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
+						myRoot.CFrame = CFrame.new(myPos) * (lookCFrame - lookCFrame.Position)
 					end
 				end))
 						return
@@ -501,9 +596,9 @@ local function activate()
 			local moveDir = (finalPos - startPos)
 			if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
 			local pos = startPos + moveDir * traveled
-			root.CFrame = CFrame.new(
-				Vector3.new(pos.X, root.Position.Y, pos.Z),
-				Vector3.new(pos.X + moveDir.X, root.Position.Y, pos.Z + moveDir.Z)
+			myRoot.CFrame = CFrame.new(
+				Vector3.new(pos.X, myRoot.Position.Y, pos.Z),
+				Vector3.new(pos.X + moveDir.X, myRoot.Position.Y, pos.Z + moveDir.Z)
 			)
 		end))
 	else
@@ -520,12 +615,12 @@ local function activate()
 	local GRAVITY = -196.2  -- studs/s^2 (Roblox default workspace gravity)
 
 		facingConn = trackActive(RunService.PreRender:Connect(function()
-			if isRagdolled() then facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
-			applyFacing(root, hum, target)
+			if isRagdolled() then facingConn:Disconnect() if myHum then myHum.AutoRotate = true end return end
+			applyFacing(myRoot, myHum, target)
 		end))
 
 		connection = trackActive(RunService.Heartbeat:Connect(function(dt)
-			if isRagdolled() then connection:Disconnect() facingConn:Disconnect() if hum then hum.AutoRotate = true end return end
+			if isRagdolled() then connection:Disconnect() facingConn:Disconnect() if myHum then myHum.AutoRotate = true end return end
 
 			-- Rebuild arc only when target moves meaningfully (saves fps)
 			local liveTarget = Vector3.new(target.Position.X, startPos.Y, target.Position.Z)
@@ -544,17 +639,17 @@ local function activate()
 			if traveled >= totalLen then
 				connection:Disconnect()
 				facingConn:Disconnect()
-				local lingerStart = tick()
+				local lingerStart = os.clock()
 				local lingerConn
 				lingerConn = trackActive(RunService.PreRender:Connect(function()
-					if isRagdolled() then lingerConn:Disconnect() if hum then hum.AutoRotate = true end return end
-					if hum then hum.AutoRotate = false end
-					if tick() - lingerStart >= FACING_LINGER then
+					if isRagdolled() then lingerConn:Disconnect() if myHum then myHum.AutoRotate = true end return end
+					if myHum then myHum.AutoRotate = false end
+					if os.clock() - lingerStart >= FACING_LINGER then
 						lingerConn:Disconnect()
-						if hum then hum.AutoRotate = true end
+						if myHum then myHum.AutoRotate = true end
 						return
 					end
-					applyFacing(root, hum, target)
+					applyFacing(myRoot, myHum, target)
 				end))
 				return
 			end
@@ -574,8 +669,8 @@ local function activate()
 				liveMid2 = initMid
 			end
 			local curvePos = quadBezier(startPos, liveMid2, liveFin2, t)
-			local newY = root.Position.Y + yVel * dt
-			root.CFrame = CFrame.new(Vector3.new(curvePos.X, newY, curvePos.Z)) * (root.CFrame - root.CFrame.Position)
+			local newY = myRoot.Position.Y + yVel * dt
+			myRoot.CFrame = CFrame.new(Vector3.new(curvePos.X, newY, curvePos.Z)) * (myRoot.CFrame - myRoot.CFrame.Position)
 		end))
 	end
 
@@ -588,7 +683,7 @@ end
 
 -- Camera Lock (middle mouse only)
 local function startCameraLock(root, target)
-	local startTime = tick()
+	local startTime = os.clock()
 	local unlocked  = false
 	local stepName  = "__dashCamLock__"
 
@@ -604,7 +699,7 @@ local function startCameraLock(root, target)
 	end
 
 	RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
-		if tick() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
+		if os.clock() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
 		local camPos = camera.CFrame.Position
 		local hDist  = Vector3.new(target.Position.X - camPos.X, 0, target.Position.Z - camPos.Z).Magnitude
 		local aimY   = camPos.Y + tanPitch * hDist
@@ -618,16 +713,13 @@ end
 -- Quick dash (MouseButton3): sideKey+Q + facing, no tween, 0.5s linger, no stack
 local function quickDash()
 	if isRagdolled() then return end
-	local char = player.Character
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if not root then return end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local target = getTarget(root, QD_RANGE)
+	if not myRoot or not myHum then return end
+	local target = getTarget(myRoot, QD_RANGE)
 	if not target then return end  -- out of range: no keys pressed at all
 
 	-- Compute side from camera
-	local tp = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
-	local to = (tp - root.Position)
+	local tp = Vector3.new(target.Position.X, myRoot.Position.Y, target.Position.Z)
+	local to = (tp - myRoot.Position)
 	if to.Magnitude < 0.01 then return end
 	to = to.Unit
 	local sd = (workspace.CurrentCamera).CFrame.RightVector:Dot(to) >= 0 and 1 or -1
@@ -639,21 +731,21 @@ local function quickDash()
 	task.delay(QD_SK_RELEASE,                    function() release(sk) end)
 	task.delay(QD_SECOND_3,                      function() press(Enum.KeyCode.Three) release(Enum.KeyCode.Three) end)
 
-	startCameraLock(root, target)
-	local startTime = tick()
+	startCameraLock(myRoot, target)
+	local startTime = os.clock()
 	local conn
 	conn = trackActive(RunService.PreRender:Connect(function()
 		if isRagdolled() then
 			conn:Disconnect()
-			if hum then hum.AutoRotate = true end
+			if myHum then myHum.AutoRotate = true end
 			return
 		end
-		if tick() - startTime >= QD_FACE_LINGER then
+		if os.clock() - startTime >= QD_FACE_LINGER then
 			conn:Disconnect()
-			if hum then hum.AutoRotate = true end
+			if myHum then myHum.AutoRotate = true end
 			return
 		end
-		applyFacing(root, hum, target)
+		applyFacing(myRoot, myHum, target)
 	end))
 end
 
@@ -669,10 +761,8 @@ local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
 			lastRLockTarget = nil  -- manual unlock clears memory
 			stopRLock()
 		else
-			local char = getCharacter()
-			local root = char and char:FindFirstChild("HumanoidRootPart")
-			if root then
-				local target = getTarget(root, math.huge)
+			if myRoot then
+				local target = getTarget(myRoot, math.huge)
 				if target then startRLock(target) end
 			end
 		end
