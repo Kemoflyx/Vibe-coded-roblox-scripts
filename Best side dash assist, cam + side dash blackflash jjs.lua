@@ -465,7 +465,7 @@ local function startRLock(target)
     local hl = Instance.new("Highlight")
     hl.FillColor         = Color3.fromRGB(255, 255, 255)
     hl.OutlineColor      = Color3.fromRGB(255, 255, 255)
-    hl.FillTransparency  = 0.5
+    hl.FillTransparency  = 0.75
     hl.Parent            = target.Parent
     rHighlight = hl
     local smoothDir = nil
