@@ -4,7 +4,6 @@ local UIS            = game:GetService("UserInputService")
 local RunService     = game:GetService("RunService")
 local VIM            = game:GetService("VirtualInputManager")
 local player         = Players.LocalPlayer
-local camera         = workspace.CurrentCamera
 
 -- Tunable values
 local COOLDOWN         = 2
@@ -70,6 +69,9 @@ local QD_SECOND_3     = 0.30
 local onCooldown  = false
 local onCooldownW = false
 
+local targetCache = {}
+local rootToData  = {}
+
 if getgenv().__dashCleanup then getgenv().__dashCleanup() end
 local cleanupTasks = {}
 local activeConns  = {}
@@ -80,10 +82,18 @@ getgenv().__dashCleanup = function()
     cleanupTasks = {}
     for _, c in ipairs(activeConns) do pcall(function() c:Disconnect() end) end
     activeConns = {}
+    
+    -- Properly disconnect custom cache connections to prevent leaks
+    for _, data in pairs(targetCache) do
+        if data.DiedConn then pcall(function() data.DiedConn:Disconnect() end) end
+    end
+    targetCache = {}
+    rootToData = {}
+    
     getgenv().__dashCleanup = nil
 end
 
--- OPTIMIZATION: Cache local player references so findFirstChild isn't spammed at 144+ FPS
+-- OPTIMIZATION: Cache local player references so FindFirstChild isn't spammed at 144+ FPS
 local myChar = nil
 local myRoot = nil
 local myHum  = nil
@@ -105,41 +115,48 @@ end)
 onCleanup(function() charAddedConn:Disconnect() end)
 onCleanup(function() charRemovingConn:Disconnect() end)
 
-local targetCache = {}
-local rootToData  = {}
 local playerConns = {}
-local diedConns   = {}
-
-local function addModel(model)
-    if model == player.Character then return end
-    local hrp = model:FindFirstChild("HumanoidRootPart")
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum then
-        task.spawn(function()
-            local t = 0
-            while t < 2 do
-                task.wait(0.05)
-                t = t + 0.05
-                if not model.Parent then return end
-                hrp = model:FindFirstChild("HumanoidRootPart")
-                hum = model:FindFirstChildOfClass("Humanoid")
-                if hrp and hum then break end
-            end
-        end)
-    end
-    if hrp and hum then
-        local data = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
-        targetCache[model] = data
-        rootToData[hrp] = data
-        local dc = hum.Died:Connect(function() targetCache[model] = nil rootToData[hrp] = nil end)
-        table.insert(diedConns, dc)
-    end
-end
 
 local function removeModel(model)
     local d = targetCache[model]
-    if d then rootToData[d.Root] = nil end
+    if d then
+        if d.DiedConn then d.DiedConn:Disconnect() end
+        rootToData[d.Root] = nil
+    end
     targetCache[model] = nil
+end
+
+local function addModel(model)
+    if model == player.Character then return end
+    if targetCache[model] then return end -- Prevent double-caching
+
+    task.spawn(function()
+        local hrp = model:FindFirstChild("HumanoidRootPart")
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        
+        -- Yielding locally instead of halting the global Descendant loop
+        local t = 0
+        while (not hrp or not hum) and t < 2 do
+            task.wait(0.1)
+            t = t + 0.1
+            if not model.Parent then return end
+            hrp = model:FindFirstChild("HumanoidRootPart")
+            hum = model:FindFirstChildOfClass("Humanoid")
+        end
+
+        if hrp and hum and model.Parent then
+            if targetCache[model] then return end 
+            
+            local data = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
+            targetCache[model] = data
+            rootToData[hrp] = data
+            
+            -- Store connection so it can be securely disposed of to prevent memory leaks
+            data.DiedConn = hum.Died:Connect(function() 
+                removeModel(model) 
+            end)
+        end
+    end)
 end
 
 local function trackPlayer(p)
@@ -150,7 +167,6 @@ local function trackPlayer(p)
     playerConns[p] = {}
     if p.Character then addModel(p.Character) end
     table.insert(playerConns[p], p.CharacterAdded:Connect(function(c)
-        task.wait(0.5)
         addModel(c)
     end))
     table.insert(playerConns[p], p.CharacterRemoving:Connect(function(c)
@@ -158,11 +174,18 @@ local function trackPlayer(p)
     end))
 end
 
-for _, model in ipairs(workspace:GetDescendants()) do
-    if model:IsA("Model") and model:FindFirstChildOfClass("Humanoid") then
-        addModel(model)
+-- OPTIMIZATION: Chunk initialization to prevent lag spikes on huge maps during execute
+task.spawn(function()
+    local count = 0
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if model:IsA("Model") and model:FindFirstChildOfClass("Humanoid") then
+            addModel(model)
+        end
+        count = count + 1
+        if count % 500 == 0 then task.wait() end
     end
-end
+end)
+
 for _, p in ipairs(Players:GetPlayers()) do trackPlayer(p) end
 
 local c1 = Players.PlayerAdded:Connect(trackPlayer)
@@ -173,18 +196,21 @@ local c2 = Players.PlayerRemoving:Connect(function(p)
         playerConns[p] = nil
     end
 end)
+
+-- OPTIMIZATION: Removed raw task.wait() inside the handler to prevent massive thread creation spikes
 local c3 = workspace.DescendantAdded:Connect(function(d)
     if d:IsA("Humanoid") then
-        task.wait(0.05)
         local model = d.Parent
-        if model and model:IsA("Model") and model:FindFirstChild("HumanoidRootPart") then
+        if model and model:IsA("Model") then
             addModel(model)
         end
     end
 end)
+
 local c4 = workspace.DescendantRemoving:Connect(function(d)
     if d:IsA("Model") and targetCache[d] then removeModel(d) end
 end)
+
 onCleanup(function() c1:Disconnect() end)
 onCleanup(function() c2:Disconnect() end)
 onCleanup(function() c3:Disconnect() end)
@@ -194,8 +220,6 @@ onCleanup(function()
         for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     end
     playerConns = {}
-    for _, c in ipairs(diedConns) do pcall(function() c:Disconnect() end) end
-    diedConns = {}
 end)
 
 trackActive(RunService.Heartbeat:Connect(function()
@@ -223,26 +247,10 @@ local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt)
 end))
 onCleanup(function() velTracker:Disconnect() end)
 
-local function getPredictedPos(targetRoot)
-    local data = rootToData[targetRoot]
-    if data then
-        local vel = data.velocity
-        return targetRoot.Position + Vector3.new(vel.X, 0, vel.Z) * DIR_LOOKAHEAD
-    end
-    return targetRoot.Position
-end
-
-local function getSmoothedPos(targetRoot)
-    local data = rootToData[targetRoot]
-    return data and data.smoothedPos or targetRoot.Position
-end
-
 local function isRagdolled()
     if not myChar or not myRoot or not myHum then return true end
     return myHum:GetState() == Enum.HumanoidStateType.Physics
 end
-
-local function getCharacter() return player.Character or player.CharacterAdded:Wait() end
 
 local function quadBezier(p0, p1, p2, t)
     return (1 - t)^2 * p0 + 2 * (1 - t) * t * p1 + t^2 * p2
@@ -316,14 +324,12 @@ local function getTarget(root, range, customRadius)
                 end
             end
         else
-            targetCache[model] = nil
+            removeModel(model) -- Cleanup safely if destroyed or dead
         end
     end
     return closest
 end
 
--- PERFORMANCE OPTIMIZATION: Added os.clock() caching to vertical aiming. 
--- Avoids executing .GetPlayingAnimationTracks() and .GetChildren() on every single render-frame.
 local lastVertCheck = 0
 local cachedVertResult = false
 
@@ -337,7 +343,11 @@ local function checkVerticalAim(root, hum)
     lastVertCheck = now
     
     local isCombatActive = false
-    local playingTracks = hum:GetPlayingAnimationTracks()
+    
+    -- OPTIMIZATION & DEPRECATION FIX: Prevent console log spam / FPS Drops via Animator
+    local animator = hum:FindFirstChildOfClass("Animator")
+    local playingTracks = animator and animator:GetPlayingAnimationTracks() or hum:GetPlayingAnimationTracks()
+    
     for _, track in ipairs(playingTracks) do
         local priority = track.Priority
         if priority == Enum.AnimationPriority.Action 
@@ -352,14 +362,11 @@ local function checkVerticalAim(root, hum)
     local st = hum:GetState()
     local isNativelyAerial = (st == Enum.HumanoidStateType.Flying or st == Enum.HumanoidStateType.Swimming)
     
-    -- If no combat animation is playing, and they aren't natively flying/swimming,
-    -- then any BodyGyro left behind is just a ghost/abandoned gyro. Force horizontal!
     if not isCombatActive and not isNativelyAerial then
         cachedVertResult = false
         return false
     end
     
-    -- If combat is active or they are natively flying/swimming, check physical rules
     if root.Anchored or hum.PlatformStand or isNativelyAerial then 
         cachedVertResult = true
         return true 
@@ -550,11 +557,12 @@ trackActive(RunService.Heartbeat:Connect(function()
 end))
 
 local function startCameraLock(root, target)
+    local currentCam = workspace.CurrentCamera
     local startTime = os.clock()
     local unlocked  = false
     local stepName  = "__dashCamLock__"
 
-    local rawYGap    = camera.CFrame.Position.Y - root.Position.Y
+    local rawYGap    = currentCam.CFrame.Position.Y - root.Position.Y
     local focusOffY  = math.clamp(rawYGap * CAM_FOCUS_MULTIPLIER, CAM_FOCUS_MIN, CAM_FOCUS_MAX) + CAM_POS_UP_OFFSET
 
     local netRightOffset = CAM_POS_RIGHT_OFFSET - CAM_POS_LEFT_OFFSET
@@ -568,7 +576,10 @@ local function startCameraLock(root, target)
 
     RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
         if os.clock() - startTime >= CAM_LOCK_DURATION then doUnlock() return end
-        local curCF = camera.CFrame
+        
+        -- Dynamic fetching ensures we don't break if character dies/reloads
+        local latestCam = workspace.CurrentCamera
+        local curCF = latestCam.CFrame
 
         local lv   = curCF.LookVector
         local hMag = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
@@ -585,7 +596,7 @@ local function startCameraLock(root, target)
             local rotCF    = facingCF * CFrame.Angles(pitchRad, 0, 0)
             local zoomDist = math.max((curCF.Position - baseFocusPos).Magnitude, 0.5)
             local correctCamPos = baseFocusPos - rotCF.LookVector * zoomDist
-            camera.CFrame = rotCF + (correctCamPos - baseFocusPos)
+            latestCam.CFrame = rotCF + (correctCamPos - baseFocusPos)
             return
         end
 
@@ -608,7 +619,7 @@ local function startCameraLock(root, target)
 
             local zoomDist = math.max((curCF.Position - focusPos).Magnitude, 0.5)
             local correctCamPos = focusPos - rotCF.LookVector * zoomDist
-            camera.CFrame = rotCF + (correctCamPos - baseFocusPos)
+            latestCam.CFrame = rotCF + (correctCamPos - baseFocusPos)
         end
     end)
 
@@ -633,7 +644,7 @@ local function activate()
             local _to0 = (_tp0 - myRoot.Position)
             if _to0.Magnitude > 0.01 then
                 _to0 = _to0.Unit
-                _preSD = (camera).CFrame.RightVector:Dot(_to0) >= 0 and 1 or -1
+                _preSD = (workspace.CurrentCamera).CFrame.RightVector:Dot(_to0) >= 0 and 1 or -1
                 _preSK = _preSD == -1 and Enum.KeyCode.A or Enum.KeyCode.D
             end
             press(_preSK)
@@ -694,7 +705,7 @@ local function activate()
         local initTo     = (initTarget - startPos)
         if initTo.Magnitude < 0.01 then return end
         initTo = initTo.Unit
-        local sideDirection = _preSD or (((camera).CFrame.RightVector):Dot(initTo) >= 0) and 1 or -1
+        local sideDirection = _preSD or (((workspace.CurrentCamera).CFrame.RightVector):Dot(initTo) >= 0) and 1 or -1
         if not _preSD and holdingW then sideDirection = -sideDirection end
         local sideKey = sideDirection == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 
@@ -748,7 +759,9 @@ local function activate()
                 local moveDir = (finalPos - startPos)
                 if moveDir.Magnitude > 0.01 then moveDir = moveDir.Unit end
                 local pos = startPos + moveDir * traveled
-                myRoot.CFrame = CFrame.new(
+                
+                -- Replaced deprecated CFrame.new(pos, look) usage
+                myRoot.CFrame = CFrame.lookAt(
                     Vector3.new(pos.X, myRoot.Position.Y, pos.Z),
                     Vector3.new(pos.X + moveDir.X, myRoot.Position.Y, pos.Z + moveDir.Z)
                 )
@@ -760,6 +773,7 @@ local function activate()
             local initFinal  = initTarget + initTo * ARCH_OVERSHOOT
             local initMid    = (startPos + initFinal) / 2 + initPerp * archWidth * sideDirection
             local arcTable, totalLen = buildArcTable(startPos, initMid, initFinal)
+            local archFaceDir = nil
 
             local facingConn
             facingConn = trackActive(RunService.PreRender:Connect(function(dt)
@@ -843,7 +857,7 @@ local function quickDash()
     local to = (tp - myRoot.Position)
     if to.Magnitude < 0.01 then return end
     to = to.Unit
-    local sd = (camera).CFrame.RightVector:Dot(to) >= 0 and 1 or -1
+    local sd = (workspace.CurrentCamera).CFrame.RightVector:Dot(to) >= 0 and 1 or -1
     local sk = sd == -1 and Enum.KeyCode.A or Enum.KeyCode.D
 
     press(sk)
@@ -884,7 +898,6 @@ local c5 = trackActive(UIS.InputBegan:Connect(function(input, gp)
             stopRLock()
         else
             if myRoot then
-                -- Pass the C_LOCK_AIM_RADIUS here so it doesn't use the E Dash default
                 local target = getTarget(myRoot, math.huge, C_LOCK_AIM_RADIUS)
                 if target then startRLock(target) end
             end
