@@ -7,23 +7,19 @@ local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
 
 -- Global Settings Setup (Force-overwrites on re-execution so your code edits apply instantly)
-getgenv().CLockSettings = { 
+getgenv().TargetLockSettings = { 
     Enabled = true, 
     Radius = 200, 
     MaxRange = 100,
     Prediction = 0.10, 
-    LerpMin = 50, -- Updated Default
-    LerpMax = 50, -- Updated Default
+    LerpMin = 50, 
+    LerpMax = 50, 
     LerpVel = 1, 
     HighlightVisible = true, 
     CamLock = false
 }
 
-local settings = getgenv().CLockSettings
-
--- Velocity smoothing settings 
-local VEL_SMOOTH_FACTOR = 0.15 
-local POS_SMOOTH_FACTOR = 0.35
+local settings = getgenv().TargetLockSettings
 
 -- Target UI Parent detection 
 local targetGuiParent = CoreGui:FindFirstChild("RobloxGui") or player:WaitForChild("PlayerGui")
@@ -41,17 +37,36 @@ getgenv().__lockCleanup = function()
     cleanupTasks = {} 
     for _, c in ipairs(activeConns) do pcall(function() c:Disconnect() end) end 
     activeConns = {} 
-    pcall(function() RunService:UnbindFromRenderStep("__CKeyCamLock__") end) 
-    local oldGui = targetGuiParent:FindFirstChild("CLock_Gui") 
+    pcall(function() RunService:UnbindFromRenderStep("__CamTrackingLoop__") end) 
+    local oldGui = targetGuiParent:FindFirstChild("TargetLock_Gui") 
     if oldGui then oldGui:Destroy() end
     getgenv().__lockCleanup = nil 
 end
 
 -- Clear old GUI instance if it exists before making a new one 
-local oldGui = targetGuiParent:FindFirstChild("CLock_Gui") 
+local oldGui = targetGuiParent:FindFirstChild("TargetLock_Gui") 
 if oldGui then oldGui:Destroy() end
 
--- Target Caching & Velocity Tracking 
+-- ==========================================
+-- LOCAL PLAYER CACHING (CPU OPTIMIZATION)
+-- ==========================================
+local myChar, myRoot, myHum
+local function updateLocalCharacter(character)
+    myChar = character
+    if character then
+        task.spawn(function()
+            myRoot = character:WaitForChild("HumanoidRootPart", 5)
+            myHum = character:WaitForChild("Humanoid", 5)
+        end)
+    else
+        myRoot, myHum = nil, nil
+    end
+end
+trackActive(player.CharacterAdded:Connect(updateLocalCharacter))
+updateLocalCharacter(player.Character)
+-- ==========================================
+
+-- Target Caching
 local targetCache = {} 
 local rootToData = {} 
 local playerConns = {} 
@@ -76,10 +91,13 @@ local function addModel(model)
         end) 
     end 
     
-    if hrp and hum then 
-        local data = { Root = hrp, Humanoid = hum, prevPos = hrp.Position, velocity = Vector3.zero, smoothedPos = hrp.Position }
+    -- Added Health Check: Don't cache bodies that are already dead
+    if hrp and hum and hum.Health > 0 then 
+        local data = { Root = hrp, Humanoid = hum }
         targetCache[model] = data 
         rootToData[hrp] = data 
+        
+        -- Event listener: Instantly clears them from cache when they die
         local dc = hum.Died:Connect(function() 
             targetCache[model] = nil 
             rootToData[hrp] = nil 
@@ -155,27 +173,10 @@ trackActive(RunService.Heartbeat:Connect(function()
 end))
 getgenv().__lastRescan = os.clock()
 
-local velTracker = trackActive(RunService.Stepped:Connect(function(_, dt) 
-    if dt <= 0 then return end 
-    for _, data in pairs(targetCache) do 
-        if not data.Root.Parent then continue end 
-        local curPos = data.Root.Position 
-        local rawVel = (curPos - data.prevPos) / dt 
-        data.velocity = data.velocity:Lerp(Vector3.new(rawVel.X, 0, rawVel.Z), VEL_SMOOTH_FACTOR)
-        data.smoothedPos = data.smoothedPos:Lerp(curPos, POS_SMOOTH_FACTOR) 
-        data.prevPos = curPos 
-    end 
-end)) 
-onCleanup(function() velTracker:Disconnect() end)
-
 -- Helper Functions 
 local function isRagdolled() 
-    local char = player.Character
-    if not char then return true end 
-    local hrp = char:FindFirstChild("HumanoidRootPart") 
-    local hum = char:FindFirstChildOfClass("Humanoid") 
-    if not hrp or not hum then return true end 
-    return hum:GetState() == Enum.HumanoidStateType.Physics 
+    if not myHum then return true end 
+    return myHum:GetState() == Enum.HumanoidStateType.Physics 
 end
 
 local function getTarget(root) 
@@ -186,6 +187,7 @@ local function getTarget(root)
     local closest, closestWorldDist = nil, math.huge
 
     for model, data in pairs(targetCache) do
+        -- Only allow locking if Health > 0
         if model.Parent and data.Humanoid.Health > 0 then
             local dist = (data.Root.Position - root.Position).Magnitude
             
@@ -223,7 +225,6 @@ local function checkVerticalAim(root, hum)
     if not root or not hum then return false end
 
     local now = os.clock()
-    -- Only do expensive table-allocating checks every 0.05 seconds instead of every single frame
     if now - lastVertCheck < 0.05 then
         return cachedVertResult
     end
@@ -254,18 +255,16 @@ local function checkVerticalAim(root, hum)
         return true 
     end
 
-    for _, v in ipairs(root:GetChildren()) do
-        if v:IsA("BodyGyro") then
-            if v.MaxTorque.X > 1000 then 
-                cachedVertResult = true
-                return true 
-            end
-        elseif v:IsA("AlignOrientation") then
-            if v.AlignType ~= Enum.AlignType.PrimaryAxisParallel and v.MaxTorque > 1000 then 
-                cachedVertResult = true
-                return true 
-            end
-        end
+    local bodyGyro = root:FindFirstChildOfClass("BodyGyro")
+    if bodyGyro and bodyGyro.MaxTorque.X > 1000 then
+        cachedVertResult = true
+        return true
+    end
+
+    local alignOri = root:FindFirstChildOfClass("AlignOrientation")
+    if alignOri and alignOri.AlignType ~= Enum.AlignType.PrimaryAxisParallel and alignOri.MaxTorque > 1000 then
+        cachedVertResult = true
+        return true
     end
 
     cachedVertResult = false
@@ -274,13 +273,13 @@ end
 
 -- Camera Tracking State Control 
 local function stopCamLock() 
-    pcall(function() RunService:UnbindFromRenderStep("__CKeyCamLock__") end) 
+    pcall(function() RunService:UnbindFromRenderStep("__CamTrackingLoop__") end) 
 end
 
 local function startCamLock(target) 
     if not settings.CamLock then return end
 
-    RunService:BindToRenderStep("__CKeyCamLock__", Enum.RenderPriority.Camera.Value + 1, function()
+    RunService:BindToRenderStep("__CamTrackingLoop__", Enum.RenderPriority.Camera.Value + 1, function()
         if not settings.CamLock or not target or not target.Parent then 
             stopCamLock() 
             return 
@@ -288,16 +287,12 @@ local function startCamLock(target)
         
         local rawTargetPos = target.Position
         local currentCamPos = camera.CFrame.Position
-        local myChar = player.Character
-        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
         
         if myRoot then
-            local hum = myChar:FindFirstChildOfClass("Humanoid")
-            if hum then
-                hum.CameraOffset = Vector3.new(0, 0, 0)
+            if myHum then
+                myHum.CameraOffset = Vector3.new(0, 0, 0)
             end
 
-            -- MATH 1: Calculate Dynamic Distance Height (Slower Transition)
             local dist = (rawTargetPos - myRoot.Position).Magnitude
             local dynamicHeight = 5
             
@@ -310,7 +305,6 @@ local function startCamLock(target)
                 dynamicHeight = 10 - (5 * alpha)
             end
 
-            -- MATH 2: Shift-Lock Nullifier (Strict Behind-The-Back Axis Alignment)
             local toPlayerDir = myRoot.Position - rawTargetPos
             local flatBackAxis = Vector3.new(toPlayerDir.X, 0, toPlayerDir.Z)
             
@@ -331,38 +325,40 @@ local function startCamLock(target)
 end
 
 -- Lock State Variables 
-local rLockActive = false 
-local rLockTarget = nil 
-local rLockConn = nil 
-local rHighlight = nil 
-local lastRLockTarget = nil
+local isLockEngaged = false 
+local currentLockedTarget = nil 
+local facingLoopConn = nil 
+local targetHighlight = nil 
+local lastLockedTarget = nil
 
 onCleanup(function() 
-    if rHighlight then rHighlight:Destroy() rHighlight = nil end 
+    if targetHighlight then targetHighlight:Destroy() targetHighlight = nil end 
     stopCamLock() 
-    local c = player.Character 
-    local h = c and c:FindFirstChildOfClass("Humanoid") 
-    if h then h.AutoRotate = true end 
+    if myHum then myHum.AutoRotate = true end 
 end)
 
-local function stopRLock() 
-    rLockActive = false 
-    rLockTarget = nil 
+-- UNLOCK FUNCTION: Safely releases everything back to the player
+local function stopTargetLock() 
+    isLockEngaged = false 
+    currentLockedTarget = nil 
     stopCamLock()
-    if rLockConn then rLockConn:Disconnect() rLockConn = nil end 
-    if rHighlight then rHighlight:Destroy() rHighlight = nil end 
-    local c = player.Character 
-    local h = c and c:FindFirstChildOfClass("Humanoid") 
-    if h then h.AutoRotate = true end 
+    if facingLoopConn then facingLoopConn:Disconnect() facingLoopConn = nil end 
+    if targetHighlight then targetHighlight:Destroy() targetHighlight = nil end 
+    if myHum then myHum.AutoRotate = true end 
 end
 
-local function startRLock(target) 
+local function startTargetLock(target) 
     if not settings.Enabled then return end
-    rLockActive = true 
-    rLockTarget = target 
-    lastRLockTarget = target
+    
+    -- Double-check before starting: Don't lock if they are dead
+    local checkData = rootToData[target]
+    if not checkData or checkData.Humanoid.Health <= 0 then return end
 
-    if rHighlight then rHighlight:Destroy() end
+    isLockEngaged = true 
+    currentLockedTarget = target 
+    lastLockedTarget = target
+
+    if targetHighlight then targetHighlight:Destroy() end
     if settings.HighlightVisible then
         local hl = Instance.new("Highlight")
         hl.FillColor         = Color3.fromRGB(255, 255, 255)
@@ -370,32 +366,41 @@ local function startRLock(target)
         hl.FillTransparency  = 0.75
         hl.OutlineTransparency = 0.4
         hl.Parent            = target.Parent
-        rHighlight = hl
+        targetHighlight = hl
     end
 
     startCamLock(target)
 
-    -- CHANGED: Removed previous lerping variables to use direct lookAt instead.
-    rLockConn = trackActive(RunService.PreRender:Connect(function(dt)
-        if not settings.Enabled then stopRLock() return end
-        if isRagdolled() then stopRLock() return end
-        local c = player.Character
-        if not c then return end
-        local r = c:FindFirstChild("HumanoidRootPart")
-        if not r then return end
-        if not rLockTarget or not rLockTarget.Parent then stopRLock() return end
-        local h = c:FindFirstChildOfClass("Humanoid")
+    facingLoopConn = trackActive(RunService.PreRender:Connect(function(dt)
+        if not settings.Enabled then stopTargetLock() return end
+        if isRagdolled() then stopTargetLock() return end
+        if not myRoot then return end
         
-        if h then h.AutoRotate = false end
+        -- DEATH & DESPAWN CHECK (Zero CPU impact, pure O(1) table lookup)
+        if not currentLockedTarget or not currentLockedTarget.Parent then 
+            stopTargetLock() 
+            return 
+        end
+        local targetData = rootToData[currentLockedTarget]
+        if not targetData or targetData.Humanoid.Health <= 0 then 
+            stopTargetLock() 
+            return 
+        end
         
-        local myPos = r.Position
-        local targetPos = rLockTarget.Position
+        if myHum then myHum.AutoRotate = false end
         
-        -- Facing Method: Keep the vertical axis level so the character does not tilt
-        local lookAtPos = Vector3.new(targetPos.X, myPos.Y, targetPos.Z)
+        local myPos = myRoot.Position
+        local targetPos = currentLockedTarget.Position + (currentLockedTarget.AssemblyLinearVelocity * settings.Prediction)
+        
+        local allowVertical = checkVerticalAim(myRoot, myHum)
+        local targetY = allowVertical and targetPos.Y or myPos.Y
+        
+        local lookAtPos = Vector3.new(targetPos.X, targetY, targetPos.Z)
         
         if (lookAtPos - myPos).Magnitude > 0.01 then
-            r.CFrame = CFrame.lookAt(myPos, lookAtPos)
+            local targetCFrame = CFrame.lookAt(myPos, lookAtPos)
+            local lerpAlpha = math.clamp(dt * settings.LerpMin, 0, 1)
+            myRoot.CFrame = myRoot.CFrame:Lerp(targetCFrame, lerpAlpha)
         end
     end))
 end
@@ -406,10 +411,14 @@ trackActive(RunService.Heartbeat:Connect(function()
     if not settings.Enabled then return end 
     local ragdolled = isRagdolled() 
     if ragdolled then wasRagdolled = true return end 
-    if wasRagdolled and not rLockActive and lastRLockTarget and lastRLockTarget.Parent then 
+    
+    if wasRagdolled and not isLockEngaged and lastLockedTarget and lastLockedTarget.Parent then 
         wasRagdolled = false 
-        local checkHum = lastRLockTarget.Parent:FindFirstChildOfClass("Humanoid") 
-        if checkHum and checkHum.Health > 0 then startRLock(lastRLockTarget) end 
+        -- Replaced FindFirstChild string-search with direct O(1) table lookup cache
+        local tData = rootToData[lastLockedTarget]
+        if tData and tData.Humanoid.Health > 0 then 
+            startTargetLock(lastLockedTarget) 
+        end 
         return 
     end 
     wasRagdolled = false 
@@ -419,14 +428,12 @@ end))
 trackActive(UIS.InputBegan:Connect(function(input, gameProcessed) 
     if gameProcessed then return end 
     if input.KeyCode == Enum.KeyCode.C then 
-        if rLockActive then 
-            stopRLock() 
+        if isLockEngaged then 
+            stopTargetLock() 
         else 
-            local char = player.Character 
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then 
-                local target = getTarget(root) 
-                if target then startRLock(target) end 
+            if myRoot then 
+                local target = getTarget(myRoot) 
+                if target then startTargetLock(target) end 
             end 
         end 
     end 
@@ -434,7 +441,7 @@ end))
 
 -- GUI CONSTRUCTION (Purely Client-Sided, Minimalist Dark Theme)
 local screenGui = Instance.new("ScreenGui") 
-screenGui.Name = "CLock_Gui"
+screenGui.Name = "TargetLock_Gui"
 screenGui.ResetOnSpawn = false 
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling 
 screenGui.Parent = targetGuiParent
@@ -456,7 +463,7 @@ corner.Parent = mainFrame
 local title = Instance.new("TextLabel") 
 title.Size = UDim2.new(1, 0, 0, 30)
 title.BackgroundTransparency = 1 
-title.Text = "C-LOCK CONFIG" 
+title.Text = "TARGET LOCK CONFIG" 
 title.TextColor3 = Color3.fromRGB(240, 240, 240) 
 title.Font = Enum.Font.SourceSansBold
 title.TextSize = 16 
@@ -530,15 +537,15 @@ end
 
 -- Populate GUI Layout Elements dynamically 
 createToggle("Enabled", "System Master", UDim2.new(0, 15, 0, 40), settings.Enabled, function(state) 
-    if not state then stopRLock() end 
+    if not state then stopTargetLock() end 
 end)
 
 createToggle("HighlightVisible", "Target Highlight", UDim2.new(0, 15, 0, 75), settings.HighlightVisible, function(state) 
-    if rLockActive and rLockTarget then startRLock(rLockTarget) end 
+    if isLockEngaged and currentLockedTarget then startTargetLock(currentLockedTarget) end 
 end)
 
 createToggle("CamLock", "Camera Tracking", UDim2.new(0, 15, 0, 110), settings.CamLock, function(state) 
-    if state and rLockActive and rLockTarget then startCamLock(rLockTarget) else stopCamLock() end 
+    if state and isLockEngaged and currentLockedTarget then startCamLock(currentLockedTarget) else stopCamLock() end 
 end)
 
 createTextBox("Radius", "Aim Radius:", UDim2.new(0, 0, 0, 150), settings.Radius, function() end) 
